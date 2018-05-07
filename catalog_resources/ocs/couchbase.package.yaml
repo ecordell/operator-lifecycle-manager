@@ -1,0 +1,5 @@
+#! package-manifest: ../../catalog_resources/ocs/couchbase-operator.v0.8.0.clusterserviceversion.yaml
+packageName: couchbase
+channels:
+- name: alpha
+  currentCSV: couchbase-operator.v0.8.0
