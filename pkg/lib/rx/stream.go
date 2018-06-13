@@ -2,6 +2,9 @@ package rx
 
 import (
 	"fmt"
+
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 )
 
 // MapFn returns a new object
@@ -325,181 +328,203 @@ type Event struct {
 	eventType string
 }
 
-//
-//// Higer order
-//type CollectedStream struct {
-//	Source
-//	subStreams []StreamInterface
-//}
-//
-////func Collect(stopc chan struct{}, streams ...StreamInterface) StreamInterface {
-////	return CollectedStream{
-////		Source:     NewStream(stopc),
-////		subStreams: streams,
-////	}
-////}
-//
-//type KubeEventType string
-//
-//const (
-//	KubeEventTypeAdd    KubeEventType = "Add"
-//	KubeEventTypeUpdate KubeEventType = "Update"
-//	KubeEventTypeDelete KubeEventType = "Delete"
-//)
-//
-//type KubeEvent struct {
-//	queueKey  string
-//	object    interface{}
-//	oldObject interface{}
-//	eventType KubeEventType
-//}
-//
-//func (k KubeEvent) GetObj() interface{} {
-//	return k.object
-//}
-//
-//func (k KubeEvent) SetObj(o interface{}) {
-//	k.object = o
-//	return
-//}
-//
-//func (k KubeEvent) Key() string {
-//	return k.queueKey
-//}
-//
-//func (k KubeEvent) EventType() string {
-//	return string(k.eventType)
-//}
-//
-//// KubeStreams are event streams that come from the informers
-//type KubeStream struct {
-//	Source
-//	queue    workqueue.RateLimitingInterface
-//	informer cache.SharedIndexInformer
-//}
-//
-//func (k KubeStream) Start(fn MapFn) {
-//	go k.informer.Run(k.stopc)
-//	if !cache.WaitForCacheSync(k.stopc, k.informer.HasSynced) {
-//		k.Done() <- struct{}{}
-//		return
-//	}
-//	k.Source.Start(fn)
-//}
-//
-//// keyFunc turns an object into a key for the queue. In the future will use a (name, namespace) struct as key
-//func (k KubeStream) keyFunc(obj interface{}) (string, bool) {
-//	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-//	if err != nil {
-//		return key, false
-//	}
-//
-//	return key, true
-//}
-//
-//func (k KubeStream) OnAdd(obj interface{}) {
-//	key, ok := k.keyFunc(obj)
-//	if !ok {
-//		return
-//	}
-//	k.events <- KubeEvent{
-//		queueKey:  key,
-//		object:    obj,
-//		oldObject: nil,
-//		eventType: KubeEventTypeAdd,
-//	}
-//}
-//func (k KubeStream) OnUpdate(oldObj, newObj interface{}) {
-//	key, ok := k.keyFunc(newObj)
-//	if !ok {
-//		return
-//	}
-//	k.events <- KubeEvent{
-//		queueKey:  key,
-//		object:    newObj,
-//		oldObject: oldObj,
-//		eventType: KubeEventTypeUpdate,
-//	}
-//}
-//func (k KubeStream) OnDelete(obj interface{}) {
-//	key, ok := k.keyFunc(obj)
-//	if !ok {
-//		return
-//	}
-//	k.events <- KubeEvent{
-//		queueKey:  key,
-//		object:    obj,
-//		oldObject: nil,
-//		eventType: KubeEventTypeDelete,
-//	}
-//}
-//
-//func NewKubeStream(stopc chan struct{}, informer cache.SharedIndexInformer) KubeStream {
-//	s := KubeStream{
-//		Source:   NewStreamWithDone(stopc),
-//		informer: informer,
-//	}
-//	s.informer.AddEventHandler(s)
-//	return s
-//}
-//
-//// QueueKubeStreams are event streams that come from the informers filtered through a workqueue
-//type QueueKubeStream struct {
-//	KubeStream
-//	queue       workqueue.RateLimitingInterface
-//	queueEvents chan EventInterface
-//}
-//
-//func NewQueueKubeStream(kubeStream KubeStream, queue workqueue.RateLimitingInterface) QueueKubeStream {
-//	q := QueueKubeStream{
-//		queue: queue,
-//	}
-//	q.KubeStream = kubeStream.Map(q.enqueueEvents).(KubeStream)
-//	return q
-//}
-//
-//func (q QueueKubeStream) enqueueEvents(event EventInterface) EventInterface {
-//	kevent, ok := event.(KubeEvent)
-//	if !ok {
-//		return nil
-//	}
-//	switch KubeEventType(kevent.EventType()) {
-//	case KubeEventTypeAdd:
-//		q.queue.Add(kevent)
-//	case KubeEventTypeUpdate:
-//		q.queue.Add(kevent)
-//	case KubeEventTypeDelete:
-//		q.queue.Forget(kevent)
-//	}
-//	// TODO this doesn't need to return and could be a `Process` or `SideEffect` method on StreamInterface
-//	return kevent
-//}
-//
-//func (q QueueKubeStream) Start(fn MapFn) {
-//	q.KubeStream.Start(fn)
-//	go func() {
-//		for q.processQueueItem() {
-//		}
-//	}()
-//}
-//
-//func (q QueueKubeStream) processQueueItem() bool {
-//	key, quit := q.queue.Get()
-//	if quit {
-//		return false
-//	}
-//	defer q.queue.Done(key)
-//
-//	kevent, ok := key.(KubeEvent)
-//	if !ok {
-//		return false
-//	}
-//
-//	q.queueEvents <- kevent
-//	q.queue.Forget(key)
-//	return true
-//}
-//
-//func (q QueueKubeStream) Events() chan EventInterface {
-//	return q.queueEvents
-//}
+type KubeEventType string
+
+const (
+	KubeEventTypeAdd    KubeEventType = "Add"
+	KubeEventTypeUpdate KubeEventType = "Update"
+	KubeEventTypeDelete KubeEventType = "Delete"
+)
+
+type KubeEvent struct {
+	queueKey  string
+	object    interface{}
+	oldObject interface{}
+	eventType KubeEventType
+}
+
+func (k KubeEvent) GetObj() interface{} {
+	return k.object
+}
+
+func (k KubeEvent) SetObj(o interface{}) {
+	k.object = o
+	return
+}
+
+func (k KubeEvent) Key() string {
+	return k.queueKey
+}
+
+func (k KubeEvent) EventType() string {
+	return string(k.eventType)
+}
+
+// KubeStreams are event streams that come from the informers
+type KubeStream struct {
+	baseStream
+	informer cache.SharedIndexInformer
+	// stop channel for informer
+	stopc chan struct{}
+}
+
+func (k KubeStream) Start() {
+	go k.informer.Run(k.stopc)
+	if !cache.WaitForCacheSync(k.stopc, k.informer.HasSynced) {
+		k.errc <- fmt.Errorf("caches didn't sync")
+		return
+	}
+	go func() {
+		defer close(k.events)
+		canceled := false
+		for e := range k.events {
+			select {
+			case <-k.cancel:
+				// cancelled, so cancel source as well
+				canceled = true
+				k.Cancel()
+			default:
+				// process events
+				if !canceled {
+					k.events <- e
+				}
+			}
+		}
+		// source closed, so get the error from source (if any)
+		k.errc <- k.Wait()
+		k.stopc <- struct{}{}
+	}()
+}
+
+func (k KubeStream) Map(fn MapFn) StreamInterface {
+	return NewStream(&k, fn)
+}
+
+func (k KubeStream) Filter(fn FilterFn) StreamInterface {
+	return NewFilterStream(&k, fn)
+}
+
+func (k KubeStream) With(stream StreamInterface) StreamInterface {
+	return NewWithStream(&k, stream)
+}
+
+// keyFunc turns an object into a key for the queue. In the future will use a (name, namespace) struct as key
+func (k KubeStream) keyFunc(obj interface{}) (string, bool) {
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	if err != nil {
+		return key, false
+	}
+
+	return key, true
+}
+
+func (k KubeStream) OnAdd(obj interface{}) {
+	key, ok := k.keyFunc(obj)
+	if !ok {
+		return
+	}
+	k.events <- KubeEvent{
+		queueKey:  key,
+		object:    obj,
+		oldObject: nil,
+		eventType: KubeEventTypeAdd,
+	}
+}
+func (k KubeStream) OnUpdate(oldObj, newObj interface{}) {
+	key, ok := k.keyFunc(newObj)
+	if !ok {
+		return
+	}
+	k.events <- KubeEvent{
+		queueKey:  key,
+		object:    newObj,
+		oldObject: oldObj,
+		eventType: KubeEventTypeUpdate,
+	}
+}
+func (k KubeStream) OnDelete(obj interface{}) {
+	key, ok := k.keyFunc(obj)
+	if !ok {
+		return
+	}
+	k.events <- KubeEvent{
+		queueKey:  key,
+		object:    obj,
+		oldObject: nil,
+		eventType: KubeEventTypeDelete,
+	}
+}
+
+func NewKubeStream(informer cache.SharedIndexInformer) KubeStream {
+	s := KubeStream{
+		baseStream: NewBaseStream(),
+		informer:   informer,
+	}
+	s.informer.AddEventHandler(s)
+	return s
+}
+
+// QueueKubeStreams are event streams that come from the informers filtered through a workqueue
+type QueueKubeStream struct {
+	kubeStream  KubeStream
+	queue       workqueue.RateLimitingInterface
+	queueEvents chan EventInterface
+}
+
+func NewQueueKubeStream(kubeStream KubeStream, queue workqueue.RateLimitingInterface) QueueKubeStream {
+	q := QueueKubeStream{
+		queue: queue,
+	}
+	q.kubeStream = kubeStream.Map(q.enqueueEvents).(KubeStream)
+
+	return q
+}
+
+func (q QueueKubeStream) enqueueEvents(event EventInterface) EventInterface {
+	kevent, ok := event.(KubeEvent)
+	if !ok {
+		return nil
+	}
+	switch KubeEventType(kevent.EventType()) {
+	case KubeEventTypeAdd:
+		q.queue.Add(kevent)
+	case KubeEventTypeUpdate:
+		q.queue.Add(kevent)
+	case KubeEventTypeDelete:
+		q.queue.Forget(kevent)
+	}
+	return kevent
+}
+
+type QueueKubeGenerator struct {
+	done  chan struct{}
+	queue workqueue.RateLimitingInterface
+}
+
+func (g QueueKubeGenerator) Next() EventInterface {
+	key, quit := g.queue.Get()
+	defer g.queue.Done(key)
+	if quit {
+		g.Done() <- struct{}{}
+	}
+
+	kevent, ok := key.(KubeEvent)
+	if !ok {
+		return nil
+	}
+
+	g.queue.Forget(key)
+	return kevent
+}
+
+func (g QueueKubeGenerator) Done() chan struct{} {
+	return g.done
+}
+
+// NewQueueSource creates a Stream that reads from a workqueue for its events
+func NewQueueSource(queue workqueue.RateLimitingInterface) Source {
+	return NewSource(QueueKubeGenerator{
+		done:  make(chan struct{}, 1),
+		queue: queue,
+	})
+}

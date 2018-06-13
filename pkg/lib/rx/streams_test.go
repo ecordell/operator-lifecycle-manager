@@ -302,6 +302,28 @@ func TestWithCancel(t *testing.T) {
 	require.EqualError(t, stream.Wait(), Canceled.Error())
 }
 
+func TestWithWith(t *testing.T) {
+	defer DetectGoroutineLeak(t, runtime.NumGoroutine())
+	levents := []TestEvent{{"1"}, {"2"}}
+	revents := []TestEvent{{"3"}, {"4"}}
+	sevents := []TestEvent{{"5"}}
+	expected := []EventInterface{TestEvent{"1"}, TestEvent{"2"}, TestEvent{"3"}, TestEvent{"4"}, TestEvent{"5"}}
+	lsource := NewSource(NewArrayStreamGenerator(levents))
+	rsource := NewSource(NewArrayStreamGenerator(revents))
+	ssource := NewSource(NewArrayStreamGenerator(sevents))
+
+	stream := lsource.With(rsource).With(ssource)
+	stream.Start()
+
+	var events []TestEvent
+	for e := range stream.Events() {
+		events = append(events, e.(TestEvent))
+	}
+
+	require.ElementsMatch(t, expected, events)
+	require.Nil(t, stream.Wait())
+}
+
 func TestFilter(t *testing.T) {
 	defer DetectGoroutineLeak(t, runtime.NumGoroutine())
 	events := []TestEvent{{"1"}, {"2"}}
