@@ -1,14 +1,16 @@
 package alm
 
 import (
-	"errors"
 	"fmt"
 	"time"
 
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
+
+	"sync"
 
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/apis"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/apis/clusterserviceversion/v1alpha1"
@@ -17,7 +19,8 @@ import (
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/informers/externalversions"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/annotator"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
-	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/queueinformer"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorclient"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/rx"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/util/workqueue"
@@ -25,85 +28,99 @@ import (
 
 var ErrRequirementsNotMet = errors.New("requirements were not met")
 
-const (
-	FallbackWakeupInterval = 30 * time.Second
-)
-
 type ALMOperator struct {
-	*queueinformer.Operator
-	csvQueue  workqueue.RateLimitingInterface
-	client    versioned.Interface
-	resolver  install.StrategyResolverInterface
-	annotator *annotator.Annotator
+	kubeStreams    []rx.QueueKubeStream
+	queueSources   []rx.QueueSource
+	kubeProcessors []rx.Consumer
+	OpClient       operatorclient.ClientInterface
+	csvQueue       workqueue.RateLimitingInterface
+	client         versioned.Interface
+	resolver       install.StrategyResolverInterface
+	annotator      *annotator.Annotator
 }
 
 func NewALMOperator(kubeconfig string, wakeupInterval time.Duration, annotations map[string]string, namespaces []string) (*ALMOperator, error) {
-	if wakeupInterval < 0 {
-		wakeupInterval = FallbackWakeupInterval
-	}
-	if len(namespaces) < 1 {
-		namespaces = []string{metav1.NamespaceAll}
-	}
-
 	// Create a new client for ALM types (CRs)
 	crClient, err := client.NewClient(kubeconfig)
 	if err != nil {
 		return nil, err
 	}
 
-	queueOperator, err := queueinformer.NewOperator(kubeconfig)
-	if err != nil {
-		return nil, err
-	}
-	namespaceAnnotator := annotator.NewAnnotator(queueOperator.OpClient, annotations)
+	opClient := operatorclient.NewClient(kubeconfig)
+	namespaceAnnotator := annotator.NewAnnotator(opClient, annotations)
 
 	op := &ALMOperator{
-		Operator:  queueOperator,
 		client:    crClient,
 		resolver:  &install.StrategyResolver{},
 		annotator: namespaceAnnotator,
+		OpClient:  opClient,
+		csvQueue:  workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "clusterserviceversions"),
 	}
 
 	// if watching all namespaces, set up a watch to annotate new namespaces
 	if len(namespaces) == 1 && namespaces[0] == metav1.NamespaceAll {
 		log.Debug("watching all namespaces, setting up queue")
-		namespaceInformer := informers.NewSharedInformerFactory(queueOperator.OpClient.KubernetesInterface(), wakeupInterval).Core().V1().Namespaces().Informer()
-		queueInformer := queueinformer.NewInformer(
-			workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "namespaces"),
-			namespaceInformer,
-			op.annotateNamespace,
-			nil,
-		)
-		op.RegisterQueueInformer(queueInformer)
-	}
-
-	// annotate namespaces that ALM operator manages
-	if err := namespaceAnnotator.AnnotateNamespaces(namespaces); err != nil {
-		return nil, err
+		namespaceInformer := informers.NewSharedInformerFactory(opClient.KubernetesInterface(), wakeupInterval).Core().V1().Namespaces().Informer()
+		namespaceQueueSource := rx.NewSimpleKubeSource([]cache.SharedIndexInformer{namespaceInformer}, "namespaces")
+		op.kubeProcessors = append(op.kubeProcessors, rx.NewConsumer(namespaceQueueSource, op.annotateNamespace))
+		op.queueSources = append(op.queueSources, namespaceQueueSource)
 	}
 
 	// set up watch on CSVs
-	csvInformers := []cache.SharedIndexInformer{}
+	var csvInformers []cache.SharedIndexInformer
 	for _, namespace := range namespaces {
 		log.Debugf("watching for CSVs in namespace %s", namespace)
 		sharedInformerFactory := externalversions.NewFilteredSharedInformerFactory(crClient, wakeupInterval, namespace, nil)
 		csvInformers = append(csvInformers, sharedInformerFactory.Clusterserviceversion().V1alpha1().ClusterServiceVersions().Informer())
 	}
-
-	// csvInformers for each namespace all use the same backing queue
-	// queue keys are namespaced
-	csvQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "clusterserviceversions")
-	queueInformers := queueinformer.New(
-		csvQueue,
-		csvInformers,
-		op.syncClusterServiceVersion,
-		nil,
-	)
-	for _, informer := range queueInformers {
-		op.RegisterQueueInformer(informer)
-	}
-	op.csvQueue = csvQueue
+	csvQueueSource := rx.NewKubeSourceForQueue(csvInformers, op.csvQueue)
+	op.queueSources = append(op.queueSources, csvQueueSource)
+	op.kubeProcessors = append(op.kubeProcessors, rx.NewConsumer(csvQueueSource, op.syncClusterServiceVersion))
 	return op, nil
+}
+
+// Run starts the operator's control loops
+func (a *ALMOperator) Run(stopc <-chan struct{}) error {
+	errChan := make(chan error)
+	go func() {
+		v, err := a.OpClient.KubernetesInterface().Discovery().ServerVersion()
+		if err != nil {
+			errChan <- errors.Wrap(err, "communicating with server failed")
+			return
+		}
+		log.Infof("connection established. cluster-version: %v", v)
+		errChan <- nil
+	}()
+
+	select {
+	case err := <-errChan:
+		if err != nil {
+			return err
+		}
+		log.Info("Operator ready")
+	case <-stopc:
+		return nil
+	}
+
+	log.Info("starting workers...")
+	for _, worker := range a.kubeProcessors {
+		worker.Consume()
+	}
+
+	var workerWG sync.WaitGroup
+	for _, worker := range a.kubeProcessors {
+		workerWG.Add(1)
+		go func() {
+			worker.Wait()
+			workerWG.Done()
+		}()
+	}
+
+	<-stopc
+
+	workerWG.Wait()
+
+	return nil
 }
 
 func (a *ALMOperator) requeueCSV(csv *v1alpha1.ClusterServiceVersion) {
@@ -118,28 +135,27 @@ func (a *ALMOperator) requeueCSV(csv *v1alpha1.ClusterServiceVersion) {
 }
 
 // syncClusterServiceVersion is the method that gets called when we see a CSV event in the cluster
-func (a *ALMOperator) syncClusterServiceVersion(obj interface{}) (syncError error) {
-	clusterServiceVersion, ok := obj.(*v1alpha1.ClusterServiceVersion)
+func (a *ALMOperator) syncClusterServiceVersion(event rx.EventInterface) {
+	clusterServiceVersion, ok := event.GetObj().(*v1alpha1.ClusterServiceVersion)
 	if !ok {
-		log.Debugf("wrong type: %#v", obj)
-		return fmt.Errorf("casting ClusterServiceVersion failed")
+		log.Errorf("casting ClusterServiceVersion failed %#v", event.GetObj())
 	}
 
 	log.Infof("syncing ClusterServiceVersion: %s", clusterServiceVersion.SelfLink)
 
-	syncError = a.transitionCSVState(clusterServiceVersion)
+	syncError := a.transitionCSVState(clusterServiceVersion)
+	log.Warn(syncError)
 
 	// Update CSV with status of transition. Log errors if we can't write them to the status.
 	if _, err := a.client.ClusterserviceversionV1alpha1().ClusterServiceVersions(clusterServiceVersion.GetNamespace()).Update(clusterServiceVersion); err != nil {
 		updateErr := errors.New("error updating ClusterServiceVersion status: " + err.Error())
 		if syncError == nil {
-			log.Info(updateErr)
-			return updateErr
+			log.Warn(updateErr)
+			return
 		}
 		syncError = fmt.Errorf("error transitioning ClusterServiceVersion: %s and error updating CSV status: %s", syncError, updateErr)
 		log.Info(syncError)
 	}
-	return
 }
 
 // transitionCSVState moves the CSV status state machine along based on the current value and the current cluster
@@ -401,19 +417,16 @@ func (a *ALMOperator) crdOwnerConflicts(in *v1alpha1.ClusterServiceVersion, csvs
 }
 
 // annotateNamespace is the method that gets called when we see a namespace event in the cluster
-func (a *ALMOperator) annotateNamespace(obj interface{}) (syncError error) {
-	namespace, ok := obj.(*corev1.Namespace)
+func (a *ALMOperator) annotateNamespace(event rx.EventInterface) {
+	namespace, ok := event.GetObj().(*corev1.Namespace)
 	if !ok {
-		log.Debugf("wrong type: %#v", obj)
-		return fmt.Errorf("casting Namespace failed")
+		log.Errorf("wrong type: %#v", event.GetObj())
 	}
 
 	log.Infof("syncing Namespace: %s", namespace.GetName())
 	if err := a.annotator.AnnotateNamespace(namespace); err != nil {
-		log.Infof("error annotating namespace '%s'", namespace.GetName())
-		return err
+		log.Errorf("error annotating namespace '%s': %s", namespace.GetName(), err.Error())
 	}
-	return nil
 }
 
 func (a *ALMOperator) isBeingReplaced(in *v1alpha1.ClusterServiceVersion, csvsInNamespace []*v1alpha1.ClusterServiceVersion) (replacedBy *v1alpha1.ClusterServiceVersion) {

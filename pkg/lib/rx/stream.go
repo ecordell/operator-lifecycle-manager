@@ -3,6 +3,7 @@ package rx
 import (
 	"fmt"
 
+	log "github.com/sirupsen/logrus"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 )
@@ -12,6 +13,9 @@ type MapFn func(event EventInterface) EventInterface
 
 // FilterFn returns bool as to whether the event should be included in the stream
 type FilterFn func(event EventInterface) bool
+
+// ConsumeFn does something with an event
+type ConsumeFn func(event EventInterface)
 
 var Canceled = fmt.Errorf("canceled")
 
@@ -55,6 +59,50 @@ func (s baseStream) Wait() error {
 
 func (s baseStream) Cancel() {
 	s.cancel <- struct{}{}
+}
+
+type ConsumerInterface interface {
+	Consume(stream StreamInterface)
+	Wait() error
+}
+
+type Consumer struct {
+	fn     ConsumeFn
+	stream StreamInterface
+	errc   chan error
+}
+
+func (c Consumer) Consume() {
+	go func() {
+		for {
+			select {
+			case e, open := <-c.stream.Events():
+				if open {
+					log.Infof("consuming: %v", e)
+					c.fn(e)
+				} else {
+					log.Warn("stream closed")
+				}
+			case err := <-c.stream.Err():
+				log.Info("stream error: " + err.Error())
+				c.errc <- err
+				return
+			}
+		}
+	}()
+	c.stream.Start()
+}
+
+func (c Consumer) Wait() error {
+	return <-c.errc
+}
+
+func NewConsumer(stream StreamInterface, fn ConsumeFn) Consumer {
+	return Consumer{
+		fn:     fn,
+		stream: stream,
+		errc:   make(chan error, 1),
+	}
 }
 
 func NewBaseStream() baseStream {
@@ -105,15 +153,20 @@ func (s Source) Start() {
 		for {
 			select {
 			case <-s.cancel:
+				log.Info("cancel")
 				canceled = true
 				break EVENTS
 			case <-s.generator.Done():
+				log.Info("generator done")
 				break EVENTS
 			default:
 				if canceled {
 					break EVENTS
 				}
-				s.Events() <- s.generator.Next()
+				log.Info("GET NEXT")
+				next := s.generator.Next()
+				log.Infof("next: %s", next)
+				s.Events() <- next
 			}
 		}
 		if canceled {
@@ -143,14 +196,18 @@ func (p Stream) Start() {
 		defer close(p.events)
 		canceled := false
 		for e := range p.source.Events() {
+			log.Infof("stream processing %v", e)
 			select {
 			case <-p.cancel:
 				// cancelled, so cancel source as well
+				log.Infof("cancelled processing %v", e)
 				canceled = true
 				p.source.Cancel()
 			default:
+				log.Infof("default %v", e)
 				// process events
 				if !canceled {
+					log.Infof("not cancelled %v", e)
 					p.events <- p.fn(e)
 				}
 			}
@@ -328,6 +385,25 @@ type Event struct {
 	eventType string
 }
 
+func (k Event) GetObj() interface{} {
+	return k.obj
+}
+
+func (k Event) SetObj(o interface{}) {
+	k.obj = o
+	return
+}
+
+func (k Event) Key() string {
+	return k.key
+}
+
+func (k Event) EventType() string {
+	return k.eventType
+}
+
+var EmptyEvent = Event{obj: nil, key: "", eventType: "None"}
+
 type KubeEventType string
 
 const (
@@ -364,35 +440,42 @@ func (k KubeEvent) EventType() string {
 type KubeStream struct {
 	baseStream
 	informer cache.SharedIndexInformer
-	// stop channel for informer
-	stopc chan struct{}
 }
 
 func (k KubeStream) Start() {
-	go k.informer.Run(k.stopc)
-	if !cache.WaitForCacheSync(k.stopc, k.informer.HasSynced) {
+	informerStopC := make(chan struct{})
+	go k.informer.Run(informerStopC)
+	log.Info("waiting for caches to sync...")
+
+	if !cache.WaitForCacheSync(informerStopC, k.informer.HasSynced) {
 		k.errc <- fmt.Errorf("caches didn't sync")
 		return
 	}
+
 	go func() {
-		defer close(k.events)
+		defer close(k.Events())
 		canceled := false
-		for e := range k.events {
+	EVENTS:
+		for {
 			select {
 			case <-k.cancel:
-				// cancelled, so cancel source as well
+				log.Info("stream cancelled")
 				canceled = true
-				k.Cancel()
+				break EVENTS
 			default:
-				// process events
-				if !canceled {
-					k.events <- e
+				if canceled {
+					log.Info("stream cancelling")
+					break EVENTS
 				}
 			}
 		}
-		// source closed, so get the error from source (if any)
-		k.errc <- k.Wait()
-		k.stopc <- struct{}{}
+		log.Info("only here after cancel")
+		informerStopC <- struct{}{}
+		if canceled {
+			k.errc <- Canceled
+		} else {
+			k.errc <- nil
+		}
 	}()
 }
 
@@ -419,6 +502,7 @@ func (k KubeStream) keyFunc(obj interface{}) (string, bool) {
 }
 
 func (k KubeStream) OnAdd(obj interface{}) {
+	log.Infof("Adding %v", obj)
 	key, ok := k.keyFunc(obj)
 	if !ok {
 		return
@@ -431,18 +515,24 @@ func (k KubeStream) OnAdd(obj interface{}) {
 	}
 }
 func (k KubeStream) OnUpdate(oldObj, newObj interface{}) {
+	log.Infof("updating %v", newObj)
 	key, ok := k.keyFunc(newObj)
 	if !ok {
 		return
 	}
+	log.Info("adding to events")
+	log.Infof("%#v", k.events)
+	log.Infof("%#v", k)
 	k.events <- KubeEvent{
 		queueKey:  key,
 		object:    newObj,
 		oldObject: oldObj,
 		eventType: KubeEventTypeUpdate,
 	}
+	log.Info("added")
 }
 func (k KubeStream) OnDelete(obj interface{}) {
+	log.Infof("deleting %v", obj)
 	key, ok := k.keyFunc(obj)
 	if !ok {
 		return
@@ -466,30 +556,31 @@ func NewKubeStream(informer cache.SharedIndexInformer) KubeStream {
 
 // QueueKubeStreams are event streams that come from the informers filtered through a workqueue
 type QueueKubeStream struct {
-	kubeStream  KubeStream
-	queue       workqueue.RateLimitingInterface
-	queueEvents chan EventInterface
+	StreamInterface
+	queue workqueue.RateLimitingInterface
 }
 
 func NewQueueKubeStream(kubeStream KubeStream, queue workqueue.RateLimitingInterface) QueueKubeStream {
 	q := QueueKubeStream{
 		queue: queue,
 	}
-	q.kubeStream = kubeStream.Map(q.enqueueEvents).(KubeStream)
-
+	q.StreamInterface = kubeStream.Map(q.enqueueEvents)
 	return q
 }
 
 func (q QueueKubeStream) enqueueEvents(event EventInterface) EventInterface {
+	log.Infof("enqueueEvents: %v", event)
 	kevent, ok := event.(KubeEvent)
+	log.Info(ok)
 	if !ok {
 		return nil
 	}
+	log.Info("queueing event: %v", kevent)
 	switch KubeEventType(kevent.EventType()) {
 	case KubeEventTypeAdd:
-		q.queue.Add(kevent)
+		q.queue.AddRateLimited(kevent)
 	case KubeEventTypeUpdate:
-		q.queue.Add(kevent)
+		q.queue.AddRateLimited(kevent)
 	case KubeEventTypeDelete:
 		q.queue.Forget(kevent)
 	}
@@ -502,15 +593,20 @@ type QueueKubeGenerator struct {
 }
 
 func (g QueueKubeGenerator) Next() EventInterface {
+	log.Info("trying to get next from queue")
 	key, quit := g.queue.Get()
+	log.Info("generating from queue: %s", key)
 	defer g.queue.Done(key)
 	if quit {
+		log.Errorf("queue shutting down")
 		g.Done() <- struct{}{}
+		g.queue.ShutDown()
 	}
 
 	kevent, ok := key.(KubeEvent)
 	if !ok {
-		return nil
+		log.Errorf("coudln't get kevent")
+		return EmptyEvent
 	}
 
 	g.queue.Forget(key)
@@ -521,10 +617,50 @@ func (g QueueKubeGenerator) Done() chan struct{} {
 	return g.done
 }
 
+type QueueSource struct {
+	Source
+	// streams are a set of streams that feed into the queue
+	streams []QueueKubeStream
+}
+
 // NewQueueSource creates a Stream that reads from a workqueue for its events
-func NewQueueSource(queue workqueue.RateLimitingInterface) Source {
-	return NewSource(QueueKubeGenerator{
-		done:  make(chan struct{}, 1),
-		queue: queue,
-	})
+func NewQueueSource(streams []QueueKubeStream, queue workqueue.RateLimitingInterface) QueueSource {
+	return QueueSource{
+		Source: NewSource(QueueKubeGenerator{
+			done:  make(chan struct{}, 1),
+			queue: queue,
+		}),
+		streams: streams,
+	}
+}
+
+func (s QueueSource) Start() {
+	for _, stream := range s.streams {
+		go stream.Start()
+		// streams need a watcher to continue writing
+		NewConsumer(stream, func(event EventInterface) {
+			return
+		}).Consume()
+	}
+	s.Source.Start()
+}
+
+// NewSimpleKubeSource creates a queue-backed source just from an informer
+func NewSimpleKubeSource(informers []cache.SharedIndexInformer, queueName string) QueueSource {
+	queue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), queueName)
+	var streams []QueueKubeStream
+	for _, informer := range informers {
+		streams = append(streams, NewQueueKubeStream(NewKubeStream(informer), queue))
+	}
+	return NewQueueSource(streams, queue)
+
+}
+
+// NewKubeSourceForQueue creates a queue-backed source just from an informer and an existing queue
+func NewKubeSourceForQueue(informers []cache.SharedIndexInformer, queue workqueue.RateLimitingInterface) QueueSource {
+	var streams []QueueKubeStream
+	for _, informer := range informers {
+		streams = append(streams, NewQueueKubeStream(NewKubeStream(informer), queue))
+	}
+	return NewQueueSource(streams, queue)
 }

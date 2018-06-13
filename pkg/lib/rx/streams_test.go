@@ -6,7 +6,15 @@ import (
 	"strconv"
 	"testing"
 
+	"time"
+
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 )
 
 type TestEvent struct {
@@ -123,6 +131,32 @@ func TestSourceCancel(t *testing.T) {
 	source.Start()
 	CancelAfter(source.Events(), source, 4)
 	require.EqualError(t, source.Wait(), Canceled.Error())
+}
+
+func TestStreamConsumer(t *testing.T) {
+	defer DetectGoroutineLeak(t, runtime.NumGoroutine())
+	events := []TestEvent{{"1"}, {"2"}}
+	expected := []EventInterface{TestEvent{"1"}, TestEvent{"2"}}
+	source := NewSource(NewArrayStreamGenerator(events))
+	i := 0
+	consumer := NewConsumer(source, func(e EventInterface) {
+		require.Equal(t, expected[i], e)
+		i += 1
+	})
+	consumer.Consume()
+	require.Nil(t, consumer.Wait())
+	require.Equal(t, 2, i)
+}
+
+func TestStreamConsumerCancel(t *testing.T) {
+	defer DetectGoroutineLeak(t, runtime.NumGoroutine())
+	source := NewSource(NewInfiniteStreamGenerator(""))
+	CancelAfter(source.Events(), source, 4)
+	consumer := NewConsumer(source, func(e EventInterface) {
+		fmt.Println("process")
+	})
+	consumer.Consume()
+	require.EqualError(t, consumer.Wait(), Canceled.Error())
 }
 
 func TestMap(t *testing.T) {
@@ -337,4 +371,219 @@ func TestFilter(t *testing.T) {
 	stream.Start()
 	ExpectEvents(t, stream, expected)
 	require.Nil(t, stream.Wait())
+}
+
+func TestKubeStream(t *testing.T) {
+	namespace := &corev1.Namespace{ObjectMeta: v1.ObjectMeta{Name: "testNS"}}
+	kclient := fake.NewSimpleClientset(namespace)
+	expected := []KubeEvent{
+		{
+			queueKey:  "testNS",
+			object:    namespace,
+			oldObject: nil,
+			eventType: KubeEventTypeAdd,
+		},
+		{
+			queueKey:  "testNS",
+			object:    namespace,
+			oldObject: namespace,
+			eventType: KubeEventTypeUpdate,
+		},
+	}
+
+	namespaceInformer := informers.NewSharedInformerFactory(kclient, 5*time.Millisecond).Core().V1().Namespaces().Informer()
+	namespaceKubeStream := NewKubeStream(namespaceInformer)
+	namespaceKubeStream.Start()
+
+	var events []KubeEvent
+	for e := range namespaceKubeStream.Events() {
+		events = append(events, e.(KubeEvent))
+		if len(events) == len(expected) {
+			namespaceKubeStream.Cancel()
+		}
+	}
+	require.EqualError(t, namespaceKubeStream.Wait(), Canceled.Error())
+	require.ElementsMatch(t, expected, events)
+	//
+	//namespaceQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "namespaces")
+	//namespaceQueueSource := rx.NewQueueSource(namespaceQueue)
+}
+
+func TestConsumeKubeStream(t *testing.T) {
+	namespace := &corev1.Namespace{ObjectMeta: v1.ObjectMeta{Name: "testNS"}}
+	kclient := fake.NewSimpleClientset(namespace)
+	expected := []KubeEvent{
+		{
+			queueKey:  "testNS",
+			object:    namespace,
+			oldObject: nil,
+			eventType: KubeEventTypeAdd,
+		},
+		{
+			queueKey:  "testNS",
+			object:    namespace,
+			oldObject: namespace,
+			eventType: KubeEventTypeUpdate,
+		},
+	}
+
+	namespaceInformer := informers.NewSharedInformerFactory(kclient, 5*time.Millisecond).Core().V1().Namespaces().Informer()
+	namespaceKubeStream := NewKubeStream(namespaceInformer)
+
+	var events []KubeEvent
+	consumer := NewConsumer(namespaceKubeStream, func(event EventInterface) {
+		events = append(events, event.(KubeEvent))
+		if len(events) == len(expected) {
+			namespaceKubeStream.Cancel()
+		}
+	})
+	consumer.Consume()
+	require.EqualError(t, consumer.Wait(), Canceled.Error())
+	require.ElementsMatch(t, expected, events)
+}
+
+func TestQueueKubeStream(t *testing.T) {
+	namespace := &corev1.Namespace{ObjectMeta: v1.ObjectMeta{Name: "testNS"}}
+	kclient := fake.NewSimpleClientset(namespace)
+	expected := []KubeEvent{
+		{
+			queueKey:  "testNS",
+			object:    namespace,
+			oldObject: nil,
+			eventType: KubeEventTypeAdd,
+		},
+		{
+			queueKey:  "testNS",
+			object:    namespace,
+			oldObject: namespace,
+			eventType: KubeEventTypeUpdate,
+		},
+	}
+
+	namespaceQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "namespaces")
+	namespaceInformer := informers.NewSharedInformerFactory(kclient, 5*time.Millisecond).Core().V1().Namespaces().Informer()
+	namespaceKubeStream := NewKubeStream(namespaceInformer)
+	namespaceQueueKubeStream := NewQueueKubeStream(namespaceKubeStream, namespaceQueue)
+	namespaceQueueKubeStream.Start()
+
+	var events []KubeEvent
+	for e := range namespaceQueueKubeStream.Events() {
+		events = append(events, e.(KubeEvent))
+		if len(events) == len(expected) {
+			namespaceKubeStream.Cancel()
+		}
+	}
+	require.EqualError(t, namespaceQueueKubeStream.Wait(), Canceled.Error())
+	require.ElementsMatch(t, expected, events)
+}
+
+func TestQueueSource(t *testing.T) {
+	namespace := &corev1.Namespace{ObjectMeta: v1.ObjectMeta{Name: "testNS"}}
+	kclient := fake.NewSimpleClientset(namespace)
+	expected := []KubeEvent{
+		{
+			queueKey:  "testNS",
+			object:    namespace,
+			oldObject: nil,
+			eventType: KubeEventTypeAdd,
+		},
+		{
+			queueKey:  "testNS",
+			object:    namespace,
+			oldObject: namespace,
+			eventType: KubeEventTypeUpdate,
+		},
+	}
+
+	namespaceInformer := informers.NewSharedInformerFactory(kclient, 5*time.Millisecond).Core().V1().Namespaces().Informer()
+	namespaceQueueSource := NewSimpleKubeSource([]cache.SharedIndexInformer{namespaceInformer}, "namsepaces")
+	namespaceQueueSource.Start()
+
+	var events []KubeEvent
+	for e := range namespaceQueueSource.Events() {
+		events = append(events, e.(KubeEvent))
+		// len - 1 is a hack to stop at the right number of events since we're a layer away
+		if len(events) == len(expected)-1 {
+			namespaceQueueSource.Cancel()
+		}
+	}
+
+	require.EqualError(t, namespaceQueueSource.Wait(), Canceled.Error())
+	require.ElementsMatch(t, expected, events)
+
+}
+
+func TestConsumeQueueSource(t *testing.T) {
+	namespace := &corev1.Namespace{ObjectMeta: v1.ObjectMeta{Name: "testNS"}}
+	kclient := fake.NewSimpleClientset(namespace)
+	expected := []KubeEvent{
+		{
+			queueKey:  "testNS",
+			object:    namespace,
+			oldObject: nil,
+			eventType: KubeEventTypeAdd,
+		},
+		{
+			queueKey:  "testNS",
+			object:    namespace,
+			oldObject: namespace,
+			eventType: KubeEventTypeUpdate,
+		},
+	}
+
+	namespaceInformer := informers.NewSharedInformerFactory(kclient, 5*time.Millisecond).Core().V1().Namespaces().Informer()
+	namespaceQueueSource := NewSimpleKubeSource([]cache.SharedIndexInformer{namespaceInformer}, "namsepaces")
+	namespaceQueueSource.Start()
+
+	var events []KubeEvent
+	consumer := NewConsumer(namespaceQueueSource, func(event EventInterface) {
+		events = append(events, event.(KubeEvent))
+		if len(events) == len(expected) {
+			namespaceQueueSource.Cancel()
+		}
+	})
+	consumer.Consume()
+
+	require.EqualError(t, consumer.Wait(), Canceled.Error())
+	require.ElementsMatch(t, expected, events)
+
+}
+
+func TestConsumerQueueFactory(t *testing.T) {
+	namespace := &corev1.Namespace{ObjectMeta: v1.ObjectMeta{Name: "testNS"}}
+	kclient := fake.NewSimpleClientset(namespace)
+	expected := []KubeEvent{
+		{
+			queueKey:  "testNS",
+			object:    namespace,
+			oldObject: nil,
+			eventType: KubeEventTypeAdd,
+		},
+		{
+			queueKey:  "testNS",
+			object:    namespace,
+			oldObject: namespace,
+			eventType: KubeEventTypeUpdate,
+		},
+	}
+
+	namespaceQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "namespaces")
+	namespaceInformer := informers.NewSharedInformerFactory(kclient, 15*time.Millisecond).Core().V1().Namespaces().Informer()
+	namespaceKubeStream := NewKubeStream(namespaceInformer)
+	namespaceQueueKubeStream := NewQueueKubeStream(namespaceKubeStream, namespaceQueue)
+	namespaceQueueSource := NewQueueSource([]QueueKubeStream{namespaceQueueKubeStream}, namespaceQueue)
+	namespaceQueueSource.Start()
+
+	var events []KubeEvent
+	consumer := NewConsumer(namespaceQueueSource, func(event EventInterface) {
+		events = append(events, event.(KubeEvent))
+		if len(events) == len(expected) {
+			namespaceQueueSource.Cancel()
+		}
+	})
+	consumer.Consume()
+
+	require.EqualError(t, consumer.Wait(), Canceled.Error())
+	require.ElementsMatch(t, expected, events)
+
 }

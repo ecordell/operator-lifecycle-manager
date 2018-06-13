@@ -10,6 +10,8 @@ alm:
     pullPolicy: IfNotPresent
   service:
     internalPort: 8080
+  commandArgs:
+  - -debug
 
 catalog:
   replicaCount: 1

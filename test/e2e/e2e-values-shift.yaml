@@ -5,7 +5,7 @@ alm:
     pullPolicy: IfNotPresent
   service:
     internalPort: 8080
-  commandArgs: -test.coverprofile=/tmp/coverage/alm-coverage.cov
+  commandArgs: -test.coverprofile=/tmp/coverage/alm-coverage.co -debug
 
 catalog:
   replicaCount: 1
@@ -14,7 +14,7 @@ catalog:
     pullPolicy: IfNotPresent
   service:
     internalPort: 8080
-  commandArgs: -test.coverprofile=/tmp/catalog-coverage.cov
+  commandArgs: -test.coverprofile=/tmp/catalog-coverage.cov -debug
 
 servicebroker:
   replicaCount: 1

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/operators/alm"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/signals"
@@ -72,6 +73,13 @@ func main() {
 	// `namespaces` will always contain at least one entry: if `*watchedNamespaces` is
 	// the empty string, the resulting array will be `[]string{""}`.
 	namespaces := strings.Split(*watchedNamespaces, ",")
+
+	if *wakeupInterval < 0 {
+		*wakeupInterval = defaultWakeupInterval
+	}
+	if len(namespaces) < 1 {
+		namespaces = []string{metav1.NamespaceAll}
+	}
 
 	// Create a new instance of the operator.
 	almOperator, err := alm.NewALMOperator(*kubeConfigPath, *wakeupInterval, annotation, namespaces)
