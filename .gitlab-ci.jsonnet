@@ -14,6 +14,7 @@ local stages_list = [
     'test_teardown',
     'integration',
     'docker_release',
+    'tag_relase',
     'deploy_staging',
     'teardown',
 ];
@@ -27,10 +28,41 @@ local jobs = {
         only: ['master', 'tags'],
     },
 
+    local onlyTags = {
+        only: ['tags'],
+    },
+
     local onlyBranch = {
         only: ['branches'],
         except: ['master', 'tags'],
     },
+
+    'tag-release': baseJob.dockerBuild {
+        // ! Only tags
+        // push the tagged release container to the 'prod' repository
+        stage: stages.docker_release,
+        before_script+: ["mkdir -p $PWD/bin"],
+        script:
+            docker.rename(images.prerelease.alm.name, images.tagRelease.alm.name) +
+            docker.rename(images.prerelease.catalog.name, images.tagRelease.catalog.name) +
+            docker.rename(images.prerelease.servicebroker.name, images.tagRelease.servicebroker.name) +
+            docker.rename(images.e2elatest.name, images.tagRelease.e2e.name),
+    } + onlyTags,
+
+    'release-pr': baseJob.dockerBuild {
+        // ! Only tags
+        // make a PR with the newly tagged images as values for release artifacts
+        stage: 'tag_relase',
+        script: [
+            "git branch ${CI_COMMIT_TAG}",
+            "export OLM_SHA=`docker inspect --format='{{index .RepoDigests 0}}' %s`" % images.tagRelease.alm.name,
+            "export CATALOG_SHA=`docker inspect --format='{{index .RepoDigests 0}}' %s`" % images.tagRelease.catalog.name,
+            "export BROKER_SHA=`docker inspect --format='{{index .RepoDigests 0}}' %s`" % images.tagRelease.servicebroker.name,
+            "make tag-release",
+            "git commit -a -m \"release ${CI_COMMIT_TAG}\"",
+            "git push origin",
+        ],
+    } + onlyTags,
 
     'container-base-build': baseJob.dockerBuild {
         stage: stages.docker_base,
@@ -71,8 +103,8 @@ local jobs = {
             docker.rename(images.prerelease.catalog.name, images.release.catalog.name) +
             docker.rename(images.prerelease.servicebroker.name, images.release.servicebroker.name) +
             docker.rename(images.e2e.name, images.e2elatest.name),
-
-    } + onlyMaster,
+        only: ['master'],
+    },
 
     // Unit-tests
     local unittest_stage = baseJob.AlmTest {

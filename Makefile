@@ -193,3 +193,14 @@ ansible-release: $(YQ)
 
 # make ver=0.3.0 release
 release: tectonic-release upstream-release ansible-release
+
+# builds a release from a git tag
+# expects $OLM_SHA $CATALOG_SHA to be defined, also $ver
+tag-release:
+	yaml w -i deploy/upstream/values.yaml alm.image.ref quay.io/coreos/$(OLM_SHA)
+	yaml w -i deploy/upstream/values.yaml catalog.image.ref quay.io/coreos/$(CATALOG_SHA)
+	yaml w -i deploy/tectonic-alm-operator/values.yaml alm.image.ref quay.io/coreos/$(OLM_SHA)
+	yaml w -i deploy/tectonic-alm-operator/values.yaml catalog.image.ref quay.io/coreos/$(CATALOG_SHA)
+	yaml w -i deploy/aos-olm/values.yaml alm.image.ref quay.io/coreos/$(OLM_SHA)
+	yaml w -i deploy/aos-olm/values.yaml catalog.image.ref quay.io/coreos/$(CATALOG_SHA)
+	$(MAKE) release
