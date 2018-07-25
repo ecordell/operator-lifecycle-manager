@@ -32,6 +32,13 @@ EXPOSE 8080
 EXPOSE 8005
 CMD ["/bin/servicebroker"]
 
+FROM alpine:latest as pkgserver
+LABEL pkgserver=true
+WORKDIR /
+COPY --from=builder /go/src/github.com/operator-framework/operator-lifecycle-manager/bin/package-server /bin/package-server
+EXPOSE 443
+CMD ["/bin/package-server"]
+
 FROM quay.io/coreos/alm-ci:base
 LABEL e2e=true
 RUN mkdir -p /var/e2e

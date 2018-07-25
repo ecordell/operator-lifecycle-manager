@@ -3,7 +3,11 @@ LABEL builder=true
 WORKDIR /go/src/github.com/operator-framework/operator-lifecycle-manager
 RUN curl -L https://github.com/stedolan/jq/releases/download/jq-1.5/jq-linux64 -o /bin/jq
 RUN chmod +x /bin/jq
-COPY . .
+COPY Makefile Makefile
+COPY pkg pkg
+COPY vendor vendor
+COPY cmd cmd
+COPY test test
 RUN make build-coverage
 RUN go test -c -o /bin/e2e ./test/e2e/...
 
@@ -28,6 +32,13 @@ COPY --from=builder /go/src/github.com/operator-framework/operator-lifecycle-man
 EXPOSE 8080
 EXPOSE 8005
 CMD ["/bin/servicebroker"]
+
+FROM alpine:latest as pkgserver
+LABEL pkgserver=true
+WORKDIR /
+COPY --from=builder /go/src/github.com/operator-framework/operator-lifecycle-manager/bin/package-server /bin/package-server
+EXPOSE 443
+CMD ["/bin/package-server"]
 
 FROM golang:1.10
 LABEL e2e=true

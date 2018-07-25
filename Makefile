@@ -50,12 +50,14 @@ run-local:
 	mkdir -p build/resources
 	. ./scripts/package-release.sh 1.0.0-local build/resources Documentation/install/local-values.yaml
 	. ./scripts/install_local.sh local build/resources
+	rm -rf build
 
 run-local-shift:
 	. ./scripts/build_local_shift.sh
 	mkdir -p build/resources
 	. ./scripts/package-release.sh 1.0.0-local build/resources Documentation/install/local-values-shift.yaml
 	. ./scripts/install_local.sh local build/resources
+	rm -rf build
 
 e2e-local:
 	. ./scripts/build_local.sh
@@ -100,7 +102,7 @@ $(CODEGEN):
 	# dep doesn't currently support downloading dependencies that don't have go in the top-level dir.
 	# can move to managing with dep when merged: https://github.com/golang/dep/pull/1545
 	mkdir -p vendor/k8s.io/code-generator
-	git clone --branch release-1.9 https://github.com/kubernetes/code-generator.git vendor/k8s.io/code-generator
+	git clone --branch release-1.11 https://github.com/kubernetes/code-generator.git vendor/k8s.io/code-generator
 	# codegen tools currently don't allow specifying custom boilerplate, so we move ours to the default location
 	mkdir -p $(GOPATH)/src/k8s.io/kubernetes/hack/boilerplate
 	cp boilerplate.go.txt $(GOPATH)/src/k8s.io/kubernetes/hack/boilerplate/boilerplate.go.txt
@@ -114,6 +116,7 @@ endef
 codegen: $(CODEGEN)
 	$(CODEGEN) all $(PKG)/pkg/api/client $(PKG)/pkg/api/apis \
 		"catalogsource:v1alpha1 clusterserviceversion:v1alpha1 installplan:v1alpha1 subscription:v1alpha1"
+	$(CODEGEN) all $(PKG)/pkg/package-server/client $(PKG)/pkg/package-server/apis "packagemanifest:v1alpha1"
 	# codegen doesn't respect pluralnames, so we manually set them here
 	$(call replace,"catalogsource")
 	$(call replace,"clusterserviceversion")
