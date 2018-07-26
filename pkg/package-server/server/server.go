@@ -9,7 +9,6 @@ import (
 
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	genericapiserver "k8s.io/apiserver/pkg/server"
-	genericoptions "k8s.io/apiserver/pkg/server/options"
 	//"k8s.io/sample-apiserver/pkg/admission/plugin/banflunder"
 	//"k8s.io/sample-apiserver/pkg/admission/packageinitializer"
 
@@ -17,10 +16,11 @@ import (
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/apiserver"
 	//clientset "k8s.io/sample-apiserver/pkg/client/clientset/internalversion"
 	//informers "k8s.io/sample-apiserver/pkg/client/informers/internalversion"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/options"
 )
 
 type PackageServerOptions struct {
-	RecommendedOptions *genericoptions.RecommendedOptions
+	RecommendedOptions *options.RecommendedOptions
 
 	//SharedInformerFactory informers.SharedInformerFactory
 	StdOut io.Writer
@@ -29,7 +29,7 @@ type PackageServerOptions struct {
 
 func NewPackageServerOptions(out, errOut io.Writer) *PackageServerOptions {
 	o := &PackageServerOptions{
-		RecommendedOptions: genericoptions.NewRecommendedOptions("packageserver", apiserver.Codecs.LegacyCodec(v1alpha1.SchemeGroupVersion)),
+		RecommendedOptions: options.NewRecommendedOptions("packageserver", apiserver.Codecs.LegacyCodec(v1alpha1.SchemeGroupVersion)),
 		StdOut:             out,
 		StdErr:             errOut,
 	}

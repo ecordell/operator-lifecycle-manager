@@ -5,6 +5,6 @@ import (
 )
 
 // Test started when the test binary is started. Only calls main.
-func TestServiceBrokerMain(t *testing.T) {
+func TestPackageServerMain(t *testing.T) {
 	main()
 }
