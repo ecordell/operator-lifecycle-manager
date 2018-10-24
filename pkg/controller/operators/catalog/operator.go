@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"k8s.io/client-go/informers"
 	"sync"
 	"time"
 
@@ -52,10 +53,11 @@ type Operator struct {
 	sourcesLastUpdate  metav1.Time
 	dependencyResolver resolver.DependencyResolver
 	subQueue           workqueue.RateLimitingInterface
+	configmapRegistryCreator *registry.ConfigMapRegistryCreator
 }
 
 // NewOperator creates a new Catalog Operator.
-func NewOperator(kubeconfigPath string, wakeupInterval time.Duration, operatorNamespace string, watchedNamespaces ...string) (*Operator, error) {
+func NewOperator(kubeconfigPath string, wakeupInterval time.Duration, configmapRegistryImage string, operatorNamespace string, watchedNamespaces ...string) (*Operator, error) {
 	// Default to watching all namespaces.
 	if watchedNamespaces == nil {
 		watchedNamespaces = []string{metav1.NamespaceAll}
@@ -141,7 +143,56 @@ func NewOperator(kubeconfigPath string, wakeupInterval time.Duration, operatorNa
 		op.RegisterQueueInformer(informer)
 	}
 
+	// Creates registry pods in response to configmaps
+	informerFactory := informers.NewSharedInformerFactory(op.OpClient.KubernetesInterface(), wakeupInterval)
+	roleInformer := informerFactory.Rbac().V1().Roles()
+	roleBindingInformer := informerFactory.Rbac().V1().RoleBindings()
+	serviceAccountInformer := informerFactory.Core().V1().ServiceAccounts()
+	serviceInformer := informerFactory.Core().V1().Services()
+	podInformer := informerFactory.Core().V1().Pods()
+	configMapInformer := informerFactory.Core().V1().ConfigMaps()
+	op.configmapRegistryCreator = &registry.ConfigMapRegistryCreator{
+		Image: configmapRegistryImage,
+		OpClient: op.OpClient,
+		RoleLister: roleInformer.Lister(),
+		RoleBindingLister: roleBindingInformer.Lister(),
+		ServiceAccountLister: serviceAccountInformer.Lister(),
+		ServiceLister: serviceInformer.Lister(),
+		PodLister: podInformer.Lister(),
+		ConfigMapLister: configMapInformer.Lister(),
+	}
+
+	// register informers for configmapRegistry
+	registryInformers := []cache.SharedIndexInformer{
+		roleInformer.Informer(),
+		roleBindingInformer.Informer(),
+		serviceAccountInformer.Informer(),
+		serviceInformer.Informer(),
+		podInformer.Informer(),
+		configMapInformer.Informer(),
+	}
+
+	// TODO: won't this possibly conflict since GVK isn't part of the queue entry?
+	registryQueueInformers := queueinformer.New(
+		workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "registry"),
+		registryInformers,
+		op.syncRegistry,
+		nil,
+		"registry",
+		metrics.NewMetricsNil(),
+	)
+	for _, informer := range registryQueueInformers {
+		op.RegisterQueueInformer(informer)
+	}
 	return op, nil
+}
+
+func (o *Operator) syncRegistry(obj interface{}) (syncError error) {
+	switch obj.(type) {
+	case *corev1.ConfigMap:
+		// requeue catalogsource
+	}
+	return nil
 }
 
 func (o *Operator) syncCatalogSources(obj interface{}) (syncError error) {
@@ -151,45 +202,21 @@ func (o *Operator) syncCatalogSources(obj interface{}) (syncError error) {
 		return fmt.Errorf("casting CatalogSource failed")
 	}
 
-	// Get the catalog source's config map
-	configMap, err := o.OpClient.KubernetesInterface().CoreV1().ConfigMaps(catsrc.GetNamespace()).Get(catsrc.Spec.ConfigMap, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to get catalog config map %s when updating status: %s", catsrc.Spec.ConfigMap, err)
+	out := catsrc.DeepCopy()
+	if err := o.configmapRegistryCreator.EnsureRegistryServer(out); err != nil {
+		return err
 	}
 
-	o.sourcesLock.Lock()
-	defer o.sourcesLock.Unlock()
-	sourceKey := registry.ResourceKey{Name: catsrc.GetName(), Namespace: catsrc.GetNamespace()}
-	_, ok = o.sources[sourceKey]
-
-	// Check for catalog source changes
-	if ok && catsrc.Status.ConfigMapResource != nil && catsrc.Status.ConfigMapResource.Name == configMap.GetName() && catsrc.Status.ConfigMapResource.ResourceVersion == configMap.GetResourceVersion() {
+	// if we didn't update the lastSync time, then skip updating the status
+	if !catsrc.Status.LastSync.Before(&out.Status.LastSync) {
 		return nil
 	}
-
-	// Update status subresource
-	out := catsrc.DeepCopy()
-	out.Status.ConfigMapResource = &v1alpha1.ConfigMapResourceReference{
-		Name:            configMap.GetName(),
-		Namespace:       configMap.GetNamespace(),
-		UID:             configMap.GetUID(),
-		ResourceVersion: configMap.GetResourceVersion(),
-	}
-	out.Status.LastSync = timeNow()
-
-	_, err = o.client.OperatorsV1alpha1().CatalogSources(out.GetNamespace()).UpdateStatus(out)
+	_, err := o.client.OperatorsV1alpha1().CatalogSources(out.GetNamespace()).UpdateStatus(out)
 	if err != nil {
 		return fmt.Errorf("failed to update catalog source %s status: %s", out.GetName(), err)
 	}
 
-	// Create a new in-mem registry
-	src, err := registry.NewInMemoryFromConfigMap(o.OpClient, out.GetNamespace(), out.Spec.ConfigMap)
-	if err != nil {
-		return fmt.Errorf("failed to create catalog source from ConfigMap %s: %s", out.Spec.ConfigMap, err)
-	}
-
 	// Update sources map
-	o.sources[sourceKey] = src
 	o.sourcesLastUpdate = timeNow()
 
 	return nil
