@@ -1,383 +1,401 @@
 package resolver
 
 import (
+	"context"
 	"fmt"
-
-	log "github.com/sirupsen/logrus"
-	corev1 "k8s.io/api/core/v1"
-	rbac "k8s.io/api/rbac/v1"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
-
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/apis/operators/v1alpha1"
-	olmerrors "github.com/operator-framework/operator-lifecycle-manager/pkg/controller/errors"
-	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
-	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry"
-	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/ownerutil"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/informers/externalversions"
+	v1alpha1listers "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/listers/operators/v1alpha1"
+	"github.com/operator-framework/operator-registry/pkg/client"
+	opregistry "github.com/operator-framework/operator-registry/pkg/registry"
+	"github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/labels"
+	"strings"
 )
 
-// DependencyResolver defines how a something that resolves dependencies (CSVs, CRDs, etc...)
-// should behave
-type DependencyResolver interface {
-	ResolveInstallPlan(sourceRefs []registry.SourceRef, existingCRDOwners map[string][]string, catalogLabelKey string, plan *v1alpha1.InstallPlan) ([]v1alpha1.Step, []registry.ResourceKey, error)
+type APISet map[opregistry.APIKey]struct{}
+
+func EmptyAPISet() APISet {
+	return map[opregistry.APIKey]struct{}{}
 }
 
-// MultiSourceResolver resolves resolves dependencies from multiple CatalogSources
-type MultiSourceResolver struct{}
+type APIOwnerSet map[opregistry.APIKey]OperatorSurface
 
-// ResolveInstallPlan resolves the given InstallPlan with all available sources
-func (resolver *MultiSourceResolver) ResolveInstallPlan(sourceRefs []registry.SourceRef, existingCRDOwners map[string][]string, catalogLabelKey string, plan *v1alpha1.InstallPlan) ([]v1alpha1.Step, []registry.ResourceKey, error) {
-	srm := make(stepResourceMap)
-	var usedSourceKeys []registry.ResourceKey
-
-	for _, csvName := range plan.Spec.ClusterServiceVersionNames {
-		csvSRM, used, err := resolver.resolveCSV(sourceRefs, existingCRDOwners, catalogLabelKey, plan.Namespace, csvName)
-		if err != nil {
-			// Could not resolve CSV in any source
-			return nil, nil, err
-		}
-
-		srm.Combine(csvSRM)
-		usedSourceKeys = append(used, usedSourceKeys...)
-	}
-
-	return srm.Plan(), usedSourceKeys, nil
+func EmptyAPIOwnerSet() APIOwnerSet {
+	return map[opregistry.APIKey]OperatorSurface{}
 }
 
-func (resolver *MultiSourceResolver) resolveCSV(sourceRefs []registry.SourceRef, existingCRDOwners map[string][]string, catalogLabelKey, planNamespace, csvName string) (stepResourceMap, []registry.ResourceKey, error) {
-	log.Debugf("resolving CSV with name: %s", csvName)
+type OperatorSet map[string]OperatorSurface
 
-	steps := make(stepResourceMap)
-	csvNamesToBeResolved := []string{csvName}
-	var usedSourceKeys []registry.ResourceKey
-
-	for len(csvNamesToBeResolved) != 0 {
-		// Pop off a CSV name.
-		currentName := csvNamesToBeResolved[0]
-		csvNamesToBeResolved = csvNamesToBeResolved[1:]
-
-		// If this CSV is already resolved, continue.
-		if _, exists := steps[currentName]; exists {
-			continue
-		}
-
-		var csvSourceKey registry.ResourceKey
-		var csv *v1alpha1.ClusterServiceVersion
-		var err error
-
-		// Attempt to Get the full CSV object for the name from any
-		for _, ref := range sourceRefs {
-			csv, err = ref.Source.FindCSVByName(currentName)
-
-			if err == nil {
-				// Found CSV
-				csvSourceKey = ref.SourceKey
-				break
-			}
-
-		}
-
-		if err != nil {
-			// Couldn't find CSV in any CatalogSource
-			return nil, nil, err
-		}
-
-		log.Debugf("found %s", csv.GetName())
-		usedSourceKeys = append(usedSourceKeys, csvSourceKey)
-
-		// Resolve each owned or required CRD for the CSV.
-		for _, crdDesc := range csv.GetAllCRDDescriptions() {
-			// Attempt to get CRD from same catalog source CSV was found in
-			crdSteps, owner, err := resolveCRDDescription(sourceRefs, existingCRDOwners, catalogLabelKey, planNamespace, crdDesc, csv.OwnsCRD(crdDesc.Name))
-			if err != nil {
-				return nil, nil, err
-			}
-
-			// If a different owner was resolved, add it to the list.
-			if owner != "" && owner != currentName {
-				csvNamesToBeResolved = append(csvNamesToBeResolved, owner)
-			} else {
-				// Add the resolved steps to the plan.
-				steps[currentName] = append(steps[currentName], crdSteps...)
-			}
-
-		}
-
-		// Manually override the namespace and create the final step for the CSV,
-		// which is for the CSV itself.
-		csv.SetNamespace(planNamespace)
-
-		// Add the sourcename as a label on the CSV, so that we know where it came from
-		labels := csv.GetLabels()
-		if labels == nil {
-			labels = map[string]string{}
-		}
-		labels[catalogLabelKey] = csvSourceKey.Name
-		csv.SetLabels(labels)
-
-		step, err := NewStepResourceFromCSV(csv)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		// Set the catalog source name and namespace
-		step.CatalogSource = csvSourceKey.Name
-		step.CatalogSourceNamespace = csvSourceKey.Namespace
-
-		// Add the final step for the CSV to the plan.
-		log.Infof("finished step: %s", step.Name)
-		steps[currentName] = append(steps[currentName], step)
-
-		// Add RBAC StepResources (must be listed *after* their owner CSV)
-		rbacSteps, err := resolveRBACStepResources(csv)
-		if err != nil {
-			return nil, nil, err
-		}
-		steps[currentName] = append(steps[currentName], rbacSteps...)
-
-	}
-
-	return steps, usedSourceKeys, nil
+func EmptyOperatorSet() OperatorSet {
+	return map[string]OperatorSurface{}
 }
 
-func resolveCRDDescription(sourceRefs []registry.SourceRef, existingCRDOwners map[string][]string, catalogLabelKey, planNamespace string, crdDesc v1alpha1.CRDDescription, owned bool) ([]v1alpha1.StepResource, string, error) {
-	log.Debugf("resolving %#v", crdDesc)
-	var steps []v1alpha1.StepResource
+type APIMultiOwnerSet map[opregistry.APIKey]OperatorSet
 
-	crdKey := registry.CRDKey{
-		Kind:    crdDesc.Kind,
-		Name:    crdDesc.Name,
-		Version: crdDesc.Version,
-	}
-
-	var crdSourceKey registry.ResourceKey
-	var crd *v1beta1.CustomResourceDefinition
-	var source registry.Source
-	var err error
-
-	// Attempt to find the CRD in any other source if the CRD is not owned
-	for _, ref := range sourceRefs {
-		source = ref.Source
-		crd, err = source.FindCRDByKey(crdKey)
-
-		if err == nil {
-			// Found the CRD
-			crdSourceKey = ref.SourceKey
-			break
-		}
-	}
-
-	if err != nil {
-		return nil, "", err
-	}
-
-	if owned {
-		// Label CRD with catalog source
-		labels := crd.GetLabels()
-		if labels == nil {
-			labels = map[string]string{}
-		}
-		labels[catalogLabelKey] = crdSourceKey.Name
-		crd.SetLabels(labels)
-
-		// Add CRD Step
-		crdSteps, err := NewStepResourcesFromCRD(crd)
-		if err != nil {
-			return nil, "", err
-		}
-
-		// Set the catalog source name and namespace
-		for _, s := range crdSteps {
-			s.CatalogSource = crdSourceKey.Name
-			s.CatalogSourceNamespace = crdSourceKey.Namespace
-			steps = append(steps, s)
-		}
-		return steps, "", nil
-	}
-
-	csvs, err := source.ListLatestCSVsForCRD(crdKey)
-	if err != nil {
-		return nil, "", err
-	}
-	if len(csvs) == 0 {
-		return nil, "", fmt.Errorf("Unknown CRD %s", crdKey)
-	}
-
-	var ownerName string
-	owners := existingCRDOwners[crdKey.Name]
-	switch len(owners) {
-	case 0:
-		// No pre-existing owner found
-		for _, csv := range csvs {
-			// Check for the default channel
-			if csv.IsDefaultChannel {
-				ownerName = csv.CSV.Name
-				break
-			}
-		}
-	case 1:
-		ownerName = owners[0]
-	default:
-		return nil, "", olmerrors.NewMultipleExistingCRDOwnersError(owners, crdKey.Name, planNamespace)
-	}
-
-	// Check empty name
-	if ownerName == "" {
-		log.Infof("No preexisting CSV or default channel found for owners of CRD %v", crdKey)
-		ownerName = csvs[0].CSV.Name
-	}
-
-	log.Infof("Found %v owner %s", crdKey, ownerName)
-	return nil, ownerName, nil
+func EmptyAPIMultiOwnerSet() APIMultiOwnerSet {
+	return map[opregistry.APIKey]OperatorSet{}
 }
 
-// resolveRBACStepResources returns a list of step resources required to satisfy the RBAC requirements of the given CSV's InstallStrategy
-func resolveRBACStepResources(csv *v1alpha1.ClusterServiceVersion) ([]v1alpha1.StepResource, error) {
-	var rbacSteps []v1alpha1.StepResource
+func (s APIMultiOwnerSet) PopAPIKey() *opregistry.APIKey {
+	for a := range s {
+		api := &opregistry.APIKey{
+			Group: a.Group,
+			Version: a.Version,
+			Kind: a.Kind,
+			Plural: a.Plural,
+		}
+		delete(s, a)
+		return api
+	}
+	return nil
+}
 
-	// User a StrategyResolver to get the strategy details
-	strategyResolver := install.StrategyResolver{}
-	strategy, err := strategyResolver.UnmarshalStrategy(csv.Spec.InstallStrategy)
+func (s APIMultiOwnerSet) PopAPIRequirers() OperatorSet {
+	requirers := EmptyOperatorSet()
+	for a := range s {
+		for key, op := range s[a] {
+			requirers[key] = NewOperatorFromOperatorSurface(op)
+		}
+		delete(s, a)
+		return requirers
+	}
+	return nil
+}
+
+// OperatorSurface describes the API surfaces provided and required by an Operator.
+type OperatorSurface interface {
+	ProvidedAPIs() APISet
+	RequiredAPIs() APISet
+	Identifier() string
+}
+
+type Operator struct {
+	name         string
+	providedAPIs APISet
+	requiredAPIs APISet
+	bundle       *opregistry.Bundle
+}
+
+var _ OperatorSurface = &Operator{}
+
+
+func NewOperatorFromOperatorSurface(in OperatorSurface) *Operator {
+	return &Operator{
+		name: in.Identifier(),
+		providedAPIs: in.ProvidedAPIs(),
+		requiredAPIs: in.RequiredAPIs(),
+	}
+}
+func NewOperatorFromBundle(bundle *opregistry.Bundle) (*Operator, error) {
+	csv, err := bundle.ClusterServiceVersion()
 	if err != nil {
 		return nil, err
 	}
-
-	// Assume the strategy is for a deployment
-	strategyDetailsDeployment, ok := strategy.(*install.StrategyDetailsDeployment)
-	if !ok {
-		return nil, fmt.Errorf("could not assert strategy implementation as deployment for CSV %s", csv.GetName())
+	providedAPIs, err := bundle.ProvidedAPIs()
+	if err != nil {
+		return nil, err
 	}
-
-	// Track created ServiceAccount StepResources
-	serviceaccounts := map[string]struct{}{}
-
-	// Resolve Permissions as StepResources
-	for i, permission := range strategyDetailsDeployment.Permissions {
-		// Create ServiceAccount if necessary
-		if _, ok := serviceaccounts[permission.ServiceAccountName]; !ok {
-			serviceAccount := &corev1.ServiceAccount{}
-			serviceAccount.SetName(permission.ServiceAccountName)
-			ownerutil.AddNonBlockingOwner(serviceAccount, csv)
-			step, err := NewStepResourceFromObject(serviceAccount, serviceAccount.GetName())
-			if err != nil {
-				return nil, err
-			}
-			rbacSteps = append(rbacSteps, step)
-
-			// Mark that a StepResource has been resolved for this ServiceAccount
-			serviceaccounts[permission.ServiceAccountName] = struct{}{}
-		}
-
-		// Create Role
-		role := &rbac.Role{
-			Rules: permission.Rules,
-		}
-		ownerutil.AddNonBlockingOwner(role, csv)
-		role.SetName(fmt.Sprintf("%s-%d", csv.GetName(), i))
-		step, err := NewStepResourceFromObject(role, role.GetName())
-		if err != nil {
-			return nil, err
-		}
-		rbacSteps = append(rbacSteps, step)
-
-		// Create RoleBinding
-		roleBinding := &rbac.RoleBinding{
-			RoleRef: rbac.RoleRef{
-				Kind:     "Role",
-				Name:     role.GetName(),
-				APIGroup: rbac.GroupName},
-			Subjects: []rbac.Subject{{
-				Kind:      "ServiceAccount",
-				Name:      permission.ServiceAccountName,
-				Namespace: csv.GetNamespace(),
-			}},
-		}
-		ownerutil.AddNonBlockingOwner(roleBinding, csv)
-		roleBinding.SetName(fmt.Sprintf("%s-%s", role.GetName(), permission.ServiceAccountName))
-		step, err = NewStepResourceFromObject(roleBinding, roleBinding.GetName())
-		if err != nil {
-			return nil, err
-		}
-		rbacSteps = append(rbacSteps, step)
+	requiredAPIs, err := bundle.RequiredAPIs()
+	if err != nil {
+		return nil, err
 	}
-
-	// Resolve ClusterPermissions as StepResources
-	for i, permission := range strategyDetailsDeployment.ClusterPermissions {
-		// Create ServiceAccount if necessary
-		if _, ok := serviceaccounts[permission.ServiceAccountName]; !ok {
-			serviceAccount := &corev1.ServiceAccount{}
-			serviceAccount.SetName(permission.ServiceAccountName)
-			ownerutil.AddNonBlockingOwner(serviceAccount, csv)
-			step, err := NewStepResourceFromObject(serviceAccount, serviceAccount.GetName())
-			if err != nil {
-				return nil, err
-			}
-			rbacSteps = append(rbacSteps, step)
-
-			// Mark that a StepResource has been resolved for this ServiceAccount
-			serviceaccounts[permission.ServiceAccountName] = struct{}{}
-		}
-
-		// Create ClusterRole
-		role := &rbac.ClusterRole{
-			Rules: permission.Rules,
-		}
-		ownerutil.AddNonBlockingOwner(role, csv)
-		role.SetName(fmt.Sprintf("%s-%d", csv.GetName(), i))
-		step, err := NewStepResourceFromObject(role, role.GetName())
-		if err != nil {
-			return nil, err
-		}
-		rbacSteps = append(rbacSteps, step)
-
-		// Create ClusterRoleBinding
-		roleBinding := &rbac.ClusterRoleBinding{
-			RoleRef: rbac.RoleRef{
-				Kind:     "ClusterRole",
-				Name:     role.GetName(),
-				APIGroup: rbac.GroupName,
-			},
-			Subjects: []rbac.Subject{{
-				Kind:      "ServiceAccount",
-				Name:      permission.ServiceAccountName,
-				Namespace: csv.GetNamespace(),
-			}},
-		}
-		ownerutil.AddNonBlockingOwner(roleBinding, csv)
-		roleBinding.SetName(fmt.Sprintf("%s-%s", role.GetName(), permission.ServiceAccountName))
-		step, err = NewStepResourceFromObject(roleBinding, roleBinding.GetName())
-		if err != nil {
-			return nil, err
-		}
-		rbacSteps = append(rbacSteps, step)
-	}
-
-	return rbacSteps, nil
+	return &Operator{
+		name:         csv.GetName(),
+		providedAPIs: providedAPIs,
+		requiredAPIs: requiredAPIs,
+		bundle:       bundle,
+	}, nil
 }
 
-type stepResourceMap map[string][]v1alpha1.StepResource
+func NewOperatorFromCSV(csv *v1alpha1.ClusterServiceVersion) (*Operator, error) {
+	providedAPIs := EmptyAPISet()
+	for _, crdDef := range csv.Spec.CustomResourceDefinitions.Owned {
+		parts := strings.SplitAfterN(crdDef.Name, ".", 2)
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("error parsing crd name: %s", crdDef.Name)
+		}
+		providedAPIs[opregistry.APIKey{Plural: parts[0], Group: parts[1], Version: crdDef.Version, Kind: crdDef.Kind}] = struct{}{}
+	}
+	for _, api := range csv.Spec.APIServiceDefinitions.Owned {
+		providedAPIs[opregistry.APIKey{Group: api.Group, Version: api.Version, Kind: api.Kind, Plural: api.Name}] = struct{}{}
+	}
 
-func (srm stepResourceMap) Plan() []v1alpha1.Step {
-	steps := make([]v1alpha1.Step, 0)
-	for csvName, stepResSlice := range srm {
-		for _, stepRes := range stepResSlice {
-			steps = append(steps, v1alpha1.Step{
-				Resolving: csvName,
-				Resource:  stepRes,
+	requiredAPIs := EmptyAPISet()
+	for _, crdDef := range csv.Spec.CustomResourceDefinitions.Required {
+		parts := strings.SplitAfterN(crdDef.Name, ".", 2)
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("error parsing crd name: %s", crdDef.Name)
+		}
+		requiredAPIs[opregistry.APIKey{Plural: parts[0], Group: parts[1], Version: crdDef.Version, Kind: crdDef.Kind}] = struct{}{}
+	}
+	for _, api := range csv.Spec.APIServiceDefinitions.Required {
+		requiredAPIs[opregistry.APIKey{Group: api.Group, Version: api.Version, Kind: api.Kind, Plural: api.Name}] = struct{}{}
+	}
+
+	return &Operator{
+		name:         csv.GetName(),
+		providedAPIs: providedAPIs,
+		requiredAPIs: requiredAPIs,
+	}, nil
+}
+
+func (o *Operator) ProvidedAPIs() APISet {
+	return o.providedAPIs
+}
+
+func (o *Operator) RequiredAPIs() APISet {
+	return o.requiredAPIs
+}
+
+func (o *Operator) Identifier() string {
+	return o.name
+}
+
+// Generation represents a set of operators and their required/provided API surfaces at a point in time.
+type Generation interface {
+	AddOperator(o OperatorSurface) error
+	RemoveOperator(o OperatorSurface)
+	MissingAPIs() APIMultiOwnerSet
+}
+
+// NamespaceGeneration represents a generation of operators in a single namespace
+type NamespaceGeneration struct {
+	providedAPIs APIOwnerSet      // only allow one provider of any api
+	requiredAPIs APIMultiOwnerSet // multiple operators may require the same api
+}
+
+func NewNamespaceGenerationFromCSVs(csvs []*v1alpha1.ClusterServiceVersion) (*NamespaceGeneration, error) {
+	g := &NamespaceGeneration{
+		providedAPIs: EmptyAPIOwnerSet(),
+		requiredAPIs: EmptyAPIMultiOwnerSet(),
+	}
+
+	for _, csv := range csvs {
+		op, err := NewOperatorFromCSV(csv)
+		if err != nil {
+			return nil, err
+		}
+		if err := g.AddOperator(op); err != nil {
+			return nil, err
+		}
+	}
+	return g, nil
+}
+
+func (g *NamespaceGeneration) AddOperator(o OperatorSurface) error {
+	// add provided apis, error if two owners
+	for api := range o.ProvidedAPIs() {
+		if provider, ok := g.providedAPIs[api]; ok && provider.Identifier() != o.Identifier() {
+			return fmt.Errorf("%v already provided by %s", api, provider.Identifier())
+		}
+		g.providedAPIs[api] = o
+	}
+
+	// add all requirers of apis
+	for api := range o.RequiredAPIs() {
+		g.requiredAPIs[api][o.Identifier()] = o
+	}
+	return nil
+}
+
+func (g *NamespaceGeneration) RemoveOperator(o OperatorSurface) {
+	for api := range o.ProvidedAPIs() {
+		delete(g.providedAPIs, api)
+	}
+	for api := range o.RequiredAPIs() {
+		delete(g.requiredAPIs[api], o.Identifier())
+		if len(g.requiredAPIs[api]) == 0 {
+			delete(g.requiredAPIs, api)
+		}
+	}
+}
+
+func (g *NamespaceGeneration) MissingAPIs() APIMultiOwnerSet {
+	missing := EmptyAPIMultiOwnerSet()
+	for requiredAPI, requirers := range g.requiredAPIs {
+
+		if _, ok := g.providedAPIs[requiredAPI]; !ok {
+			missing[requiredAPI] = requirers
+		}
+	}
+	return missing
+}
+
+type CatalogKey struct {
+	Name      string
+	Namespace string
+}
+
+func (k *CatalogKey) String() string {
+	return fmt.Sprintf("%s/%s", k.Name, k.Namespace)
+}
+
+type OperatorSteps struct {
+	Subscription *v1alpha1.Subscription
+	CSV          *v1alpha1.ClusterServiceVersion
+}
+
+type Resolver interface {
+	ResolveSteps(sources map[CatalogKey]client.Interface) ([]*v1alpha1.Step, []*v1alpha1.Subscription, error)
+}
+
+type NamespaceResolver struct {
+	subLister v1alpha1listers.SubscriptionLister
+	csvLister v1alpha1listers.ClusterServiceVersionLister
+	namespace string
+}
+
+var _ Resolver = &NamespaceResolver{}
+
+func NewNamespaceResolver(namespace string, factory externalversions.SharedInformerFactory) *NamespaceResolver {
+	return &NamespaceResolver{
+		namespace: namespace,
+		subLister: factory.Operators().V1alpha1().Subscriptions().Lister(),
+		csvLister: factory.Operators().V1alpha1().ClusterServiceVersions().Lister(),
+	}
+}
+
+//TODO: sources should be ordered
+func (r *NamespaceResolver) ResolveSteps(sources map[CatalogKey]client.Interface) ([]*v1alpha1.Step, []*v1alpha1.Subscription, error) {
+	if len(sources) == 0 {
+		return nil, nil, fmt.Errorf("no catalog sources available")
+	}
+
+	csvs, err := r.csvLister.List(labels.Everything())
+	if err != nil {
+		return nil, nil, err
+	}
+	gen, err := NewNamespaceGenerationFromCSVs(csvs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	subs, err := r.subLister.List(labels.Everything())
+
+	// fetch any subscriptions that don't yet have Operators installed
+	resolvedBundles := map[string]*opregistry.Bundle{}
+	modifiedSubscriptions := []*v1alpha1.Subscription{}
+	for _, s := range subs {
+		if s.Status.State != v1alpha1.SubscriptionStateAtLatest {
+			bundle, err := r.findInSources(sources, s.Spec.Package, s.Spec.Channel, CatalogKey{Name: s.Spec.CatalogSource, Namespace: s.Spec.CatalogSourceNamespace})
+			if err != nil {
+				return nil, nil, errors.Wrapf(err, "%s/%s not found", s.Spec.Package, s.Spec.Channel)
+			}
+			resolvedBundles[bundle.Name] = bundle
+			s.Status.CurrentCSV = bundle.Name
+			modifiedSubscriptions = append(modifiedSubscriptions, s)
+		}
+	}
+
+	// adjust the provided/required APIs of the current generation based on the new operators
+	for _, b := range resolvedBundles {
+		o, err := NewOperatorFromBundle(b)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "error parsing bundle")
+		}
+		if err := gen.AddOperator(o); err != nil {
+			if err != nil {
+				return nil, nil, errors.Wrap(err, "error calculating generation changes due to new bundle")
+			}
+		}
+	}
+
+	// if we're still missing apis, the first thing we do is try to resolve other providers to attempt to remove missing apis
+	netNewBundles := map[string]*opregistry.Bundle{}
+	missingAPIs := gen.MissingAPIs()
+	for len(missingAPIs) > 0 {
+		api := missingAPIs.PopAPIKey()
+		if api == nil {
+			continue
+		}
+
+		bundle, err := r.findProviderInSources(sources, *api)
+		if err != nil {
+			netNewBundles[bundle.Name] = bundle
+
+			o, err := NewOperatorFromBundle(bundle)
+			if err != nil {
+				return nil, nil, errors.Wrap(err, "error parsing bundle")
+			}
+			if err := gen.AddOperator(o); err != nil {
+				if err != nil {
+					return nil, nil, errors.Wrap(err, "error calculating generation changes due to new bundle")
+				}
+			}
+		}
+	}
+
+	// if we're still missing apis, we attempt to downgrade operators until the generation is valid
+	for missingAPIs := gen.MissingAPIs(); len(missingAPIs) > 0; {
+		requirers := missingAPIs.PopAPIRequirers()
+		for opName, op := range requirers {
+			gen.RemoveOperator(op)
+			delete(resolvedBundles, opName)
+			delete(netNewBundles, opName)
+		}
+	}
+
+	steps := []*v1alpha1.Step{}
+	for name, b := range resolvedBundles {
+		bundleSteps, err := NewStepResourceFromBundle(b, r.namespace)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to turn bundle into steps")
+		}
+		for _, s := range bundleSteps {
+			steps = append(steps, &v1alpha1.Step{
+				Resolving: name,
+				Resource:  s,
+				Status:    v1alpha1.StepStatusUnknown,
+			})
+		}
+	}
+	for name, b := range netNewBundles {
+		bundleSteps, err := NewStepResourceFromBundle(b, r.namespace)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to turn bundle into steps")
+		}
+		for _, s := range bundleSteps {
+			steps = append(steps, &v1alpha1.Step{
+				Resolving: name,
+				Resource:  s,
 				Status:    v1alpha1.StepStatusUnknown,
 			})
 		}
 	}
 
-	return steps
+	// TODO add subscription steps for each net new bundle
+	return steps, modifiedSubscriptions, nil
 }
 
-func (srm stepResourceMap) Combine(y stepResourceMap) {
-	for csvName, stepResSlice := range y {
-		// Skip any redundant steps.
-		if _, alreadyExists := srm[csvName]; alreadyExists {
-			continue
-		}
+type SourceQuerier interface {
+	findProvider(sources map[CatalogKey]client.Interface, api opregistry.APIKey) (*opregistry.Bundle, error)
+}
 
-		srm[csvName] = stepResSlice
+func (r *NamespaceResolver) findProviderInSources(sources map[CatalogKey]client.Interface, api opregistry.APIKey) (*opregistry.Bundle, error) {
+	for _, source := range sources {
+		bundle, err := source.GetBundleThatProvides(context.TODO(), api.Group, api.Version, api.Kind)
+		if err == nil {
+			return bundle, nil
+		}
 	}
+	return nil, fmt.Errorf("%s not provided by a package in any CatalogSource", api)
+}
+
+func (r *NamespaceResolver) findInSources(sources map[CatalogKey]client.Interface, pkgName, channelName string, sourceKey CatalogKey) (*opregistry.Bundle, error) {
+	if sourceKey.Name != "" && sourceKey.Namespace != "" {
+		source, ok := sources[sourceKey]
+		if !ok {
+			return nil, fmt.Errorf("CatalogSource %s not found", sourceKey.Name)
+		}
+		return source.GetBundleInPackageChannel(context.TODO(), pkgName, channelName)
+	}
+
+	for _, source := range sources {
+		bundle, err := source.GetBundleInPackageChannel(context.TODO(), pkgName, channelName)
+		if err == nil {
+			return bundle, nil
+		}
+	}
+	return nil, fmt.Errorf("%s/%s not found in any available CatalogSource", pkgName, channelName)
 }

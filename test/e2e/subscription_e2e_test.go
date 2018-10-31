@@ -22,28 +22,6 @@ import (
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorclient"
 )
 
-// Test Subscription behavior
-
-//   I. Creating a new subscription
-//      A. If package is not installed, creating a subscription should install latest version
-//      B. If package is already installed, creating a subscription should upgrade it to the latest
-//         version
-//      C. If a subscription for the package already exists, it should be marked as a duplicate and
-//         ignored by the catalog operator (?)
-
-//  II. Updates - existing subscription for package, and a newer version is added to the channel
-//      A. Test bumping up 1 version (for a normal tectonic upgrade)
-//         If the new version directly replaces the existing install, the latest version should be
-//         directly installed.
-//      B. Test bumping up multiple versions (simulate external catalog where we might jump
-//         multiple versions, or an offline install where we might upgrade services all at once)
-//         If existing install is more than one version behind, it should be upgraded stepping
-//         through all intermediate versions.
-
-// III. Channel switched on the subscription
-//      A. If the current csv exists in the new channel, create installplans to update to the
-//         latest in the new channel
-//      B. Current csv does not exist in the new channel, subscription should have an error status
 var doubleInstance = int32(2)
 
 const (
@@ -203,6 +181,7 @@ func init() {
 		panic(err)
 	}
 	dummyCatalogConfigMap.Data[registry.ConfigMapCSVName] = string(csvsRaw)
+	dummyCatalogConfigMap.Data[registry.ConfigMapCRDName] = ""
 }
 
 func initCatalog(t *testing.T, c operatorclient.ClientInterface, crc versioned.Interface) error {
@@ -261,6 +240,7 @@ func fetchSubscription(t *testing.T, crc versioned.Interface, namespace, name st
 
 	err = wait.Poll(pollInterval, pollDuration, func() (bool, error) {
 		fetchedSubscription, err = crc.OperatorsV1alpha1().Subscriptions(namespace).Get(name, metav1.GetOptions{})
+		t.Log(fetchedSubscription.Status)
 		if err != nil || fetchedSubscription == nil {
 			return false, err
 		}
@@ -311,14 +291,6 @@ func createSubscription(t *testing.T, crc versioned.Interface, namespace, name, 
 	return buildSubscriptionCleanupFunc(t, crc, subscription)
 }
 
-func checkForCSV(t *testing.T, c operatorclient.ClientInterface, name string) (*v1alpha1.ClusterServiceVersion, error) {
-	var csv *v1alpha1.ClusterServiceVersion
-	unstrCSV, err := waitForAndFetchCustomResource(t, c, v1alpha1.GroupVersion, v1alpha1.ClusterServiceVersionKind, name)
-	require.NoError(t, err)
-	err = runtime.DefaultUnstructuredConverter.FromUnstructured(unstrCSV.Object, &csv)
-	return csv, err
-}
-
 //   I. Creating a new subscription
 //      A. If package is not installed, creating a subscription should install latest version
 func TestCreateNewSubscription(t *testing.T) {
@@ -331,13 +303,12 @@ func TestCreateNewSubscription(t *testing.T) {
 	cleanup := createSubscription(t, crc, testNamespace, testSubscriptionName, testPackageName, betaChannel, v1alpha1.ApprovalAutomatic)
 	defer cleanup()
 
-	csv, err := checkForCSV(t, c, beta)
-	require.NoError(t, err)
-	require.NotNil(t, csv)
-
 	subscription, err := fetchSubscription(t, crc, testNamespace, testSubscriptionName, subscriptionStateAtLatestChecker)
 	require.NoError(t, err)
 	require.NotNil(t, subscription)
+
+	_, err = fetchCSV(t, crc, subscription.Status.CurrentCSV, buildCSVConditionChecker(v1alpha1.CSVPhaseSucceeded))
+	require.NoError(t, err)
 
 	// Fetch subscription again to check for unnecessary control loops
 	sameSubscription, err := fetchSubscription(t, crc, testNamespace, testSubscriptionName, subscriptionStateAtLatestChecker)
@@ -362,13 +333,11 @@ func TestCreateNewSubscriptionAgain(t *testing.T) {
 	subscriptionCleanup := createSubscription(t, crc, testNamespace, testSubscriptionName, testPackageName, alphaChannel, v1alpha1.ApprovalAutomatic)
 	defer subscriptionCleanup()
 
-	csv, err := checkForCSV(t, c, alpha)
-	require.NoError(t, err)
-	require.NotNil(t, csv)
-
 	subscription, err := fetchSubscription(t, crc, testNamespace, testSubscriptionName, subscriptionStateAtLatestChecker)
 	require.NoError(t, err)
 	require.NotNil(t, subscription)
+	_, err = fetchCSV(t, crc, subscription.Status.CurrentCSV, buildCSVConditionChecker(v1alpha1.CSVPhaseSucceeded))
+	require.NoError(t, err)
 
 	// check for unnecessary control loops
 	sameSubscription, err := fetchSubscription(t, crc, testNamespace, testSubscriptionName, subscriptionStateAtLatestChecker)
@@ -399,7 +368,14 @@ func TestCreateNewSubscriptionManualApproval(t *testing.T) {
 	require.Equal(t, v1alpha1.ApprovalManual, installPlan.Spec.Approval)
 	require.Equal(t, v1alpha1.InstallPlanPhaseRequiresApproval, installPlan.Status.Phase)
 
-	// Fetch subscription again to check for unnecessary control loops
-	sameSubscription, err := fetchSubscription(t, crc, testNamespace, "manual-subscription", subscriptionStateUpgradePendingChecker)
-	compareResources(t, subscription, sameSubscription)
+	installPlan.Spec.Approved = true
+	_, err = crc.OperatorsV1alpha1().InstallPlans(testNamespace).Update(installPlan)
+	require.NoError(t, err)
+
+	subscription, err = fetchSubscription(t, crc, testNamespace, "manual-subscription", subscriptionStateUpgradePendingChecker)
+	require.NoError(t, err)
+	require.NotNil(t, subscription)
+
+	_, err = fetchCSV(t, crc, subscription.Status.CurrentCSV, buildCSVConditionChecker(v1alpha1.CSVPhaseSucceeded))
+	require.NoError(t, err)
 }

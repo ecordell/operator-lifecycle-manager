@@ -75,8 +75,8 @@ func resolveInstallPlan(t *testing.T, resolver DependencyResolver) {
 			}
 
 			srcRef := registry.SourceRef{
-				Source:    src,
-				SourceKey: srcKey,
+				SourceClient: src,
+				SourceKey:    srcKey,
 			}
 			// Generate an ordered list of source refs
 			srcRefs := []registry.SourceRef{srcRef}
@@ -243,8 +243,8 @@ func multiSourceResolveInstallPlan(t *testing.T, resolver DependencyResolver) {
 			i := 0
 			for srcKey, source := range sources {
 				srcRefs[i] = registry.SourceRef{
-					Source:    source,
-					SourceKey: srcKey,
+					SourceClient: source,
+					SourceKey:    srcKey,
 				}
 				i++
 			}
@@ -489,7 +489,7 @@ func namespaceAndChannelAwareResolveInstallPlan(t *testing.T, resolver Dependenc
 						Name:      "pasta-source",
 						Namespace: tt.namespace,
 					},
-					Source: source,
+					SourceClient: source,
 				},
 			}
 

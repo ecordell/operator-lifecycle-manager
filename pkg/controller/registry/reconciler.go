@@ -6,37 +6,47 @@ import (
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorclient"
 	"github.com/sirupsen/logrus"
 	"k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	v1lister "k8s.io/client-go/listers/core/v1"
 	rbacv1lister "k8s.io/client-go/listers/rbac/v1"
 	"time"
 )
 
-//for test stubbing and for ensuring standardization of timezones to UTC
+// for test stubbing and for ensuring standardization of timezones to UTC
 var timeNow = func() metav1.Time { return metav1.NewTime(time.Now().UTC()) }
 
-// catalogsource wraps CatalogSource to add our derivation methods
-type catalogSourceDeriver struct {
-	v1alpha1.CatalogSource
+// catalogSourceDecorator wraps CatalogSource to add additional methods
+type catalogSourceDecorator struct {
+	*v1alpha1.CatalogSource
 }
 
-func (s *catalogSourceDeriver) serviceAccountName() string {
+func (s *catalogSourceDecorator) serviceAccountName() string {
 	return s.GetName()+"-configmap-server"
 }
 
-func (s *catalogSourceDeriver) roleName() string {
-	return s.GetName() + "configmap-reader"
+func (s *catalogSourceDecorator) roleName() string {
+	return s.GetName() + "-configmap-reader"
 }
 
+func (s *catalogSourceDecorator) Selector() labels.Selector {
+	return labels.SelectorFromValidatedSet(map[string]string{
+		"olm.catalogSource": s.GetName(),
+	})
+}
 
-func (s *catalogSourceDeriver) ConfigMapChanges(configMap *v1.ConfigMap) bool {
-	if s.Status.ConfigMapResource == nil {
-		return false
+func (s *catalogSourceDecorator) Labels() map[string]string {
+	return map[string]string{
+		"olm.catalogSource": s.GetName(),
+		"olm.configMapResourceVersion": s.Status.ConfigMapResource.ResourceVersion,
 	}
-	if s.Status.ConfigMapResource.Name != configMap.GetName() {
-		return false
+}
+
+func (s *catalogSourceDecorator) ConfigMapChanges(configMap *v1.ConfigMap) bool {
+	if s.Status.ConfigMapResource == nil {
+		return true
 	}
 	if s.Status.ConfigMapResource.ResourceVersion == configMap.GetResourceVersion() {
 		return false
@@ -44,7 +54,7 @@ func (s *catalogSourceDeriver) ConfigMapChanges(configMap *v1.ConfigMap) bool {
 	return true
 }
 
-func (s *catalogSourceDeriver) Service() *v1.Service {
+func (s *catalogSourceDecorator) Service() *v1.Service {
 	return &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: s.GetName(),
@@ -58,18 +68,17 @@ func (s *catalogSourceDeriver) Service() *v1.Service {
 					TargetPort: intstr.FromInt(50051),
 				},
 			},
-			Selector: map[string]string{
-				"catalogSourceDeriver": s.GetName(),
-			},
+			Selector: s.Labels(),
 		},
 	}
 }
 
-func (s *catalogSourceDeriver) Pod(image string) *v1.Pod {
+func (s *catalogSourceDecorator) Pod(image string) *v1.Pod {
 	return &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: s.GetName(),
+			GenerateName: s.GetName()+"-",
 			Namespace: s.GetNamespace(),
+			Labels: s.Labels(),
 		},
 		Spec: v1.PodSpec{
 			Containers: []v1.Container{
@@ -77,6 +86,12 @@ func (s *catalogSourceDeriver) Pod(image string) *v1.Pod {
 					Name: "configmap-registry-server",
 					Image: image,
 					Args: []string{"-c", s.GetName(), "-n", s.GetNamespace()},
+					Ports: []v1.ContainerPort{
+						{
+							Name: "grpc",
+							ContainerPort: 50051,
+						},
+					},
 				},
 			},
 			ServiceAccountName: s.GetName()+"-configmap-server",
@@ -84,7 +99,7 @@ func (s *catalogSourceDeriver) Pod(image string) *v1.Pod {
 	}
 }
 
-func (s *catalogSourceDeriver) ServiceAccount() *v1.ServiceAccount {
+func (s *catalogSourceDecorator) ServiceAccount() *v1.ServiceAccount {
 	return &v1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: s.serviceAccountName(),
@@ -93,7 +108,7 @@ func (s *catalogSourceDeriver) ServiceAccount() *v1.ServiceAccount {
 	}
 }
 
-func (s *catalogSourceDeriver) Role() *rbacv1.Role {
+func (s *catalogSourceDecorator) Role() *rbacv1.Role {
 	return &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: s.roleName(),
@@ -103,14 +118,14 @@ func (s *catalogSourceDeriver) Role() *rbacv1.Role {
 			{
 				Verbs: []string{"get"},
 				APIGroups: []string{""},
-				Resources: []string{"ConfigMap"},
+				Resources: []string{"configmaps"},
 				ResourceNames: []string{s.Spec.ConfigMap},
 			},
 		},
 	}
 }
 
-func (s *catalogSourceDeriver) RoleBinding() *rbacv1.RoleBinding {
+func (s *catalogSourceDecorator) RoleBinding() *rbacv1.RoleBinding {
 	return &rbacv1.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: s.GetName() + "-server-configmap-reader",
@@ -119,7 +134,6 @@ func (s *catalogSourceDeriver) RoleBinding() *rbacv1.RoleBinding {
 		Subjects: []rbacv1.Subject{
 			{
 				Kind: "ServiceAccount",
-				APIGroup: "rbac.authorization.k8s.io",
 				Name: s.serviceAccountName(),
 				Namespace: s.GetNamespace(),
 			},
@@ -132,11 +146,11 @@ func (s *catalogSourceDeriver) RoleBinding() *rbacv1.RoleBinding {
 	}
 }
 
-type RegistryCreator interface {
+type RegistryReconciler interface {
 	EnsureRegistryServer(catalogSource *v1alpha1.CatalogSource) error
 }
 
-type ConfigMapRegistryCreator struct {
+type ConfigMapRegistryReconciler struct {
 	ConfigMapLister      v1lister.ConfigMapLister
 	ServiceLister        v1lister.ServiceLister
 	RoleBindingLister    rbacv1lister.RoleBindingLister
@@ -147,9 +161,9 @@ type ConfigMapRegistryCreator struct {
 	Image                string
 }
 
-var _ RegistryCreator = &ConfigMapRegistryCreator{}
+var _ RegistryReconciler = &ConfigMapRegistryReconciler{}
 
-func (c *ConfigMapRegistryCreator) currentService(source catalogSourceDeriver) *v1.Service {
+func (c *ConfigMapRegistryReconciler) currentService(source catalogSourceDecorator) *v1.Service {
 	serviceName := source.Service().GetName()
  	service, err := c.ServiceLister.Services(source.GetNamespace()).Get(serviceName)
  	if err!= nil {
@@ -159,7 +173,7 @@ func (c *ConfigMapRegistryCreator) currentService(source catalogSourceDeriver) *
  	return service
 }
 
-func (c *ConfigMapRegistryCreator) currentServiceAccount(source catalogSourceDeriver) *v1.ServiceAccount {
+func (c *ConfigMapRegistryReconciler) currentServiceAccount(source catalogSourceDecorator) *v1.ServiceAccount {
 	serviceAccountName := source.ServiceAccount().GetName()
 	serviceAccount, err := c.ServiceAccountLister.ServiceAccounts(source.GetNamespace()).Get(serviceAccountName)
 	if err!= nil {
@@ -169,7 +183,7 @@ func (c *ConfigMapRegistryCreator) currentServiceAccount(source catalogSourceDer
 	return serviceAccount
 }
 
-func (c *ConfigMapRegistryCreator) currentRole(source catalogSourceDeriver) *rbacv1.Role {
+func (c *ConfigMapRegistryReconciler) currentRole(source catalogSourceDecorator) *rbacv1.Role {
 	roleName := source.Role().GetName()
 	role, err := c.RoleLister.Roles(source.GetNamespace()).Get(roleName)
 	if err!= nil {
@@ -179,7 +193,7 @@ func (c *ConfigMapRegistryCreator) currentRole(source catalogSourceDeriver) *rba
 	return role
 }
 
-func (c *ConfigMapRegistryCreator) currentRoleBinding(source catalogSourceDeriver) *rbacv1.RoleBinding {
+func (c *ConfigMapRegistryReconciler) currentRoleBinding(source catalogSourceDecorator) *rbacv1.RoleBinding {
 	roleBindingName := source.RoleBinding().GetName()
 	roleBinding, err := c.RoleBindingLister.RoleBindings(source.GetNamespace()).Get(roleBindingName)
 	if err!= nil {
@@ -189,23 +203,35 @@ func (c *ConfigMapRegistryCreator) currentRoleBinding(source catalogSourceDerive
 	return roleBinding
 }
 
-func (c *ConfigMapRegistryCreator) currentPod(source catalogSourceDeriver, image string) *v1.Pod {
+func (c *ConfigMapRegistryReconciler) currentPods(source catalogSourceDecorator, image string) []*v1.Pod {
 	podName := source.Pod(image).GetName()
-	pod, err := c.PodLister.Pods(source.GetNamespace()).Get(podName)
+	pods, err := c.PodLister.Pods(source.GetNamespace()).List(source.Selector())
 	if err!= nil {
 		logrus.WithField("pod", podName).WithError(err).Warn("couldn't find pod in cache")
 		return nil
 	}
-	return pod
+	if len(pods) > 1 {
+		logrus.WithField("selector", source.Selector()).Warn("multiple pods found for selector")
+	}
+	return pods
+}
+
+func (c *ConfigMapRegistryReconciler) currentPodsWithCorrectResourceVersion(source catalogSourceDecorator, image string) []*v1.Pod {
+	podName := source.Pod(image).GetName()
+	pods, err := c.PodLister.Pods(source.GetNamespace()).List(labels.SelectorFromValidatedSet(source.Labels()))
+	if err!= nil {
+		logrus.WithField("pod", podName).WithError(err).Warn("couldn't find pod in cache")
+		return nil
+	}
+	if len(pods) > 1 {
+		logrus.WithField("selector", source.Selector()).Warn("multiple pods found for selector")
+	}
+	return pods
 }
 
 // Ensure that all components of registry server are up to date.
-func (c *ConfigMapRegistryCreator) EnsureRegistryServer(catalogSource *v1alpha1.CatalogSource) error {
-	source := catalogSourceDeriver{*catalogSource}
-
-	if source.Status.ConfigMapResource == nil || source.Status.ConfigMapResource.UID == "" {
-		return fmt.Errorf("no configmap in catalogsource status")
-	}
+func (c *ConfigMapRegistryReconciler) EnsureRegistryServer(catalogSource *v1alpha1.CatalogSource) error {
+	source := catalogSourceDecorator{catalogSource}
 
 	// fetch configmap first, exit early if we can't find it
 	configMap, err := c.ConfigMapLister.ConfigMaps(source.GetNamespace()).Get(source.Spec.ConfigMap)
@@ -213,12 +239,25 @@ func (c *ConfigMapRegistryCreator) EnsureRegistryServer(catalogSource *v1alpha1.
 		return err
 	}
 
+	if source.ConfigMapChanges(configMap) {
+		catalogSource.Status.ConfigMapResource = &v1alpha1.ConfigMapResourceReference{
+			Name: configMap.GetName(),
+			Namespace: configMap.GetNamespace(),
+			UID: configMap.GetUID(),
+			ResourceVersion: configMap.GetResourceVersion(),
+		}
+	}
+
 	// if service status is nil, we force create every object to ensure they're created the first time
 	overwrite := source.Status.RegistryServiceStatus == nil
 
 	// recreate the pod if there are configmap changes; this causes the db to be rebuilt
-	overwritePod := overwrite || source.ConfigMapChanges(configMap)
+	// recreate the pod if no existing pod is serving the latest configmap
+	overwritePod := overwrite || source.ConfigMapChanges(configMap) || len(c.currentPodsWithCorrectResourceVersion(source, c.Image)) == 0
 
+	//TODO: add ownerreferences to all of these objects
+
+	//TODO: if any of these error out, we should write a status back (possibly set RegistryServiceStatus to nil so they get recreated)
 	if err := c.ensureServiceAccount(source, overwrite); err != nil {
 		return err
 	}
@@ -234,17 +273,20 @@ func (c *ConfigMapRegistryCreator) EnsureRegistryServer(catalogSource *v1alpha1.
 	if err := c.ensureService(source, overwrite); err!= nil {
 		return err
 	}
-	catalogSource.Status.RegistryServiceStatus = &v1alpha1.RegistryServiceStatus{
-		Protocol: "grpc",
-		ServiceName: source.Service().GetName(),
-		ServiceNamespace: source.GetNamespace(),
-		Port: string(source.Service().Spec.Ports[0].Port),
+
+	if overwritePod {
+		catalogSource.Status.RegistryServiceStatus = &v1alpha1.RegistryServiceStatus{
+			Protocol:         "grpc",
+			ServiceName:      source.Service().GetName(),
+			ServiceNamespace: source.GetNamespace(),
+			Port:             fmt.Sprintf("%d", source.Service().Spec.Ports[0].Port),
+		}
+		catalogSource.Status.LastSync = timeNow()
 	}
-	catalogSource.Status.LastSync = timeNow()
 	return nil
 }
 
-func (c *ConfigMapRegistryCreator) ensureServiceAccount(source catalogSourceDeriver, overwrite bool) error {
+func (c *ConfigMapRegistryReconciler) ensureServiceAccount(source catalogSourceDecorator, overwrite bool) error {
 	serviceAccount := source.ServiceAccount()
 	if c.currentServiceAccount(source) != nil {
 		if !overwrite {
@@ -258,7 +300,7 @@ func (c *ConfigMapRegistryCreator) ensureServiceAccount(source catalogSourceDeri
 	return err
 }
 
-func (c *ConfigMapRegistryCreator) ensureRole(source catalogSourceDeriver, overwrite bool) error {
+func (c *ConfigMapRegistryReconciler) ensureRole(source catalogSourceDecorator, overwrite bool) error {
 	role := source.Role()
 	if c.currentRole(source) != nil {
 		if !overwrite {
@@ -272,7 +314,7 @@ func (c *ConfigMapRegistryCreator) ensureRole(source catalogSourceDeriver, overw
 	return err
 }
 
-func (c *ConfigMapRegistryCreator) ensureRoleBinding(source catalogSourceDeriver, overwrite bool) error {
+func (c *ConfigMapRegistryReconciler) ensureRoleBinding(source catalogSourceDecorator, overwrite bool) error {
 	roleBinding := source.RoleBinding()
 	if c.currentRoleBinding(source) != nil {
 		if !overwrite {
@@ -286,9 +328,9 @@ func (c *ConfigMapRegistryCreator) ensureRoleBinding(source catalogSourceDeriver
 	return err
 }
 
-func (c *ConfigMapRegistryCreator) ensurePod(source catalogSourceDeriver, overwrite bool) error {
+func (c *ConfigMapRegistryReconciler) ensurePod(source catalogSourceDecorator, overwrite bool) error {
 	pod := source.Pod(c.Image)
-	if c.currentPod(source, c.Image) != nil {
+	if len(c.currentPods(source, c.Image)) > 0 {
 		if !overwrite {
 			return nil
 		}
@@ -300,7 +342,7 @@ func (c *ConfigMapRegistryCreator) ensurePod(source catalogSourceDeriver, overwr
 	return err
 }
 
-func (c *ConfigMapRegistryCreator) ensureService(source catalogSourceDeriver, overwrite bool) error {
+func (c *ConfigMapRegistryReconciler) ensureService(source catalogSourceDecorator, overwrite bool) error {
 	service := source.Service()
 	if c.currentService(source) != nil {
 		if !overwrite {
