@@ -47,14 +47,14 @@ var timeNow = func() metav1.Time { return metav1.NewTime(time.Now().UTC()) }
 // resolving dependencies in a catalog.
 type Operator struct {
 	*queueinformer.Operator
-	client             versioned.Interface
-	namespace          string
-	sources            map[resolver.CatalogKey]registryclient.Interface
-	sourcesLock        sync.RWMutex
-	sourcesLastUpdate  metav1.Time
-	resolvers          map[string]resolver.Resolver
-	subQueue           workqueue.RateLimitingInterface
-	configmapRegistryCreator *registry.ConfigMapRegistryReconciler
+	client                      versioned.Interface
+	namespace                   string
+	sources                     map[resolver.CatalogKey]registryclient.Interface
+	sourcesLock                 sync.RWMutex
+	sourcesLastUpdate           metav1.Time
+	resolvers                   map[string]resolver.Resolver
+	subQueue                    workqueue.RateLimitingInterface
+	configmapRegistryReconciler *registry.ConfigMapRegistryReconciler
 }
 
 // NewOperator creates a new Catalog Operator.
@@ -154,7 +154,7 @@ func NewOperator(kubeconfigPath string, wakeupInterval time.Duration, configmapR
 	serviceInformer := informerFactory.Core().V1().Services()
 	podInformer := informerFactory.Core().V1().Pods()
 	configMapInformer := informerFactory.Core().V1().ConfigMaps()
-	op.configmapRegistryCreator = &registry.ConfigMapRegistryReconciler{
+	op.configmapRegistryReconciler = &registry.ConfigMapRegistryReconciler{
 		Image: configmapRegistryImage,
 		OpClient: op.OpClient,
 		RoleLister: roleInformer.Lister(),
@@ -165,7 +165,7 @@ func NewOperator(kubeconfigPath string, wakeupInterval time.Duration, configmapR
 		ConfigMapLister: configMapInformer.Lister(),
 	}
 
-	// register informers for configmapRegistry
+	// register informers for configmapRegistryReconciler
 	registryInformers := []cache.SharedIndexInformer{
 		roleInformer.Informer(),
 		roleBindingInformer.Informer(),
@@ -206,7 +206,7 @@ func (o *Operator) syncCatalogSources(obj interface{}) (syncError error) {
 	_, ok = o.sources[sourceKey]
 
 	out := catsrc.DeepCopy()
-	if err := o.configmapRegistryCreator.EnsureRegistryServer(out); err != nil {
+	if err := o.configmapRegistryReconciler.EnsureRegistryServer(out); err != nil {
 		logger.WithError(err).Warn("couldn't ensure registry server")
 		return err
 	}

@@ -2,7 +2,12 @@ package catalog
 
 import (
 	"errors"
+	"fmt"
+	"github.com/operator-framework/operator-registry/pkg/client"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/tools/cache"
 	"testing"
+	"time"
 
 	"github.com/ghodss/yaml"
 
@@ -129,8 +134,6 @@ func TestTransitionInstallPlan(t *testing.T) {
 }
 
 func TestSyncCatalogSources(t *testing.T) {
-	resolver := &resolver.MultiSourceResolver{}
-
 	tests := []struct {
 		testName          string
 		operatorNamespace string
@@ -212,31 +215,6 @@ func TestSyncCatalogSources(t *testing.T) {
 			expectedError: nil,
 		},
 		{
-			testName:          "CatalogSourceWithInvalidConfigMap",
-			operatorNamespace: "cool-namespace",
-			catalogSource: &v1alpha1.CatalogSource{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "cool-catalog",
-					Namespace: "cool-namespace",
-					UID:       types.UID("catalog-uid"),
-				},
-				Spec: v1alpha1.CatalogSourceSpec{
-					ConfigMap: "cool-configmap",
-				},
-			},
-			configMap: &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:            "cool-configmap",
-					Namespace:       "cool-namespace",
-					UID:             types.UID("configmap-uid"),
-					ResourceVersion: "resource-version",
-				},
-				Data: map[string]string{},
-			},
-			expectedStatus: nil,
-			expectedError:  errors.New("failed to create catalog source from ConfigMap cool-configmap: error parsing ConfigMap cool-configmap: no valid resources found"),
-		},
-		{
 			testName:          "CatalogSourceWithMissingConfigMap",
 			operatorNamespace: "cool-namespace",
 			catalogSource: &v1alpha1.CatalogSource{
@@ -251,17 +229,20 @@ func TestSyncCatalogSources(t *testing.T) {
 			},
 			configMap:      &corev1.ConfigMap{},
 			expectedStatus: nil,
-			expectedError:  errors.New("failed to get catalog config map cool-configmap when updating status: configmaps \"cool-configmap\" not found"),
+			expectedError:  errors.New("configmaps \"cool-configmap\" not found"),
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
+			stopc := make(chan struct{})
+			defer close(stopc)
+
 			// Create existing objects
 			clientObjs := []runtime.Object{tt.catalogSource}
 			k8sObjs := []runtime.Object{tt.configMap}
 
 			// Create test operator
-			op, err := NewFakeOperator(clientObjs, k8sObjs, nil, nil, resolver, tt.operatorNamespace)
+			op, err := NewFakeOperator(clientObjs, k8sObjs, nil, nil, tt.operatorNamespace, stopc)
 			require.NoError(t, err)
 
 			// Run sync
@@ -282,7 +263,7 @@ func TestSyncCatalogSources(t *testing.T) {
 				require.Equal(t, *tt.expectedStatus.ConfigMapResource, *updated.Status.ConfigMapResource)
 
 				// Ensure that the catalog source has been loaded into memory
-				_, ok := op.sources[registry.ResourceKey{Name: tt.catalogSource.GetName(), Namespace: tt.catalogSource.GetNamespace()}]
+				_, ok := op.sources[resolver.CatalogKey{Name: tt.catalogSource.GetName(), Namespace: tt.catalogSource.GetNamespace()}]
 				require.True(t, ok, "Expected catalog was not loaded into memory")
 			}
 		})
@@ -373,8 +354,8 @@ func fakeConfigMapData() map[string]string {
 	return data
 }
 
-// NewFakeOprator creates a new operator using fake clients
-func NewFakeOperator(clientObjs []runtime.Object, k8sObjs []runtime.Object, extObjs []runtime.Object, regObjs []runtime.Object, resolver resolver.DependencyResolver, namespace string) (*Operator, error) {
+// NewFakeOperator creates a new operator using fake clients
+func NewFakeOperator(clientObjs []runtime.Object, k8sObjs []runtime.Object, extObjs []runtime.Object, regObjs []runtime.Object, namespace string, stopc <- chan struct{}) (*Operator, error) {
 	// Create client fakes
 	clientFake := fake.NewSimpleClientset(clientObjs...)
 	opClientFake := operatorclient.NewClient(k8sfake.NewSimpleClientset(k8sObjs...), apiextensionsfake.NewSimpleClientset(extObjs...), apiregistrationfake.NewSimpleClientset(regObjs...))
@@ -385,14 +366,54 @@ func NewFakeOperator(clientObjs []runtime.Object, k8sObjs []runtime.Object, extO
 		return nil, err
 	}
 
+	// Creates registry pods in response to configmaps
+	informerFactory := informers.NewSharedInformerFactory(opClientFake.KubernetesInterface(), 5*time.Second)
+	roleInformer := informerFactory.Rbac().V1().Roles()
+	roleBindingInformer := informerFactory.Rbac().V1().RoleBindings()
+	serviceAccountInformer := informerFactory.Core().V1().ServiceAccounts()
+	serviceInformer := informerFactory.Core().V1().Services()
+	podInformer := informerFactory.Core().V1().Pods()
+	configMapInformer := informerFactory.Core().V1().ConfigMaps()
+
 	// Create the new operator
 	queueOperator, err := queueinformer.NewOperatorFromClient(opClientFake)
 	op := &Operator{
 		Operator:           queueOperator,
 		client:             clientFake,
 		namespace:          namespace,
-		sources:            make(map[registry.ResourceKey]registry.Source),
-		dependencyResolver: resolver,
+		sources:            make(map[resolver.CatalogKey]client.Interface),
+	}
+
+	op.configmapRegistryReconciler = &registry.ConfigMapRegistryReconciler{
+		Image: "test:pod",
+		OpClient: op.OpClient,
+		RoleLister: roleInformer.Lister(),
+		RoleBindingLister: roleBindingInformer.Lister(),
+		ServiceAccountLister: serviceAccountInformer.Lister(),
+		ServiceLister: serviceInformer.Lister(),
+		PodLister: podInformer.Lister(),
+		ConfigMapLister: configMapInformer.Lister(),
+	}
+
+	// register informers for configmapRegistryReconciler
+	registryInformers := []cache.SharedIndexInformer{
+		roleInformer.Informer(),
+		roleBindingInformer.Informer(),
+		serviceAccountInformer.Informer(),
+		serviceInformer.Informer(),
+		podInformer.Informer(),
+		configMapInformer.Informer(),
+	}
+
+	var hasSyncedCheckFns []cache.InformerSynced
+	for _, informer := range registryInformers {
+		op.RegisterInformer(informer)
+		hasSyncedCheckFns = append(hasSyncedCheckFns, informer.HasSynced)
+		go informer.Run(stopc)
+	}
+
+	if ok := cache.WaitForCacheSync(stopc, hasSyncedCheckFns...); !ok {
+		return nil, fmt.Errorf("failed to wait for caches to sync")
 	}
 
 	return op, nil
@@ -404,7 +425,7 @@ func installPlan(names ...string) v1alpha1.InstallPlan {
 			ClusterServiceVersionNames: names,
 		},
 		Status: v1alpha1.InstallPlanStatus{
-			Plan: []v1alpha1.Step{},
+			Plan: []*v1alpha1.Step{},
 		},
 	}
 }
