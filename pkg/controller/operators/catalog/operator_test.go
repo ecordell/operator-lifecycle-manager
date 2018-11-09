@@ -3,10 +3,12 @@ package catalog
 import (
 	"errors"
 	"fmt"
-	"k8s.io/client-go/informers"
-	"k8s.io/client-go/tools/cache"
 	"testing"
 	"time"
+
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorlister"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/tools/cache"
 
 	"github.com/ghodss/yaml"
 
@@ -153,7 +155,7 @@ func TestSyncCatalogSources(t *testing.T) {
 					UID:       types.UID("catalog-uid"),
 				},
 				Spec: v1alpha1.CatalogSourceSpec{
-					ConfigMap: "cool-configmap",
+					ConfigMap:  "cool-configmap",
 					SourceType: "nope",
 				},
 			},
@@ -167,7 +169,7 @@ func TestSyncCatalogSources(t *testing.T) {
 				Data: fakeConfigMapData(),
 			},
 			expectedStatus: nil,
-			expectedError: nil,
+			expectedError:  nil,
 		},
 		{
 			testName:          "CatalogSourceWithBackingConfigMap",
@@ -179,7 +181,7 @@ func TestSyncCatalogSources(t *testing.T) {
 					UID:       types.UID("catalog-uid"),
 				},
 				Spec: v1alpha1.CatalogSourceSpec{
-					ConfigMap: "cool-configmap",
+					ConfigMap:  "cool-configmap",
 					SourceType: v1alpha1.SourceTypeInternal,
 				},
 			},
@@ -212,7 +214,7 @@ func TestSyncCatalogSources(t *testing.T) {
 					UID:       types.UID("catalog-uid"),
 				},
 				Spec: v1alpha1.CatalogSourceSpec{
-					ConfigMap: "cool-configmap",
+					ConfigMap:  "cool-configmap",
 					SourceType: v1alpha1.SourceTypeConfigmap,
 				},
 				Status: v1alpha1.CatalogSourceStatus{
@@ -253,7 +255,7 @@ func TestSyncCatalogSources(t *testing.T) {
 					UID:       types.UID("catalog-uid"),
 				},
 				Spec: v1alpha1.CatalogSourceSpec{
-					ConfigMap: "cool-configmap",
+					ConfigMap:  "cool-configmap",
 					SourceType: v1alpha1.SourceTypeConfigmap,
 				},
 			},
@@ -279,7 +281,7 @@ func TestSyncCatalogSources(t *testing.T) {
 					UID:       types.UID("catalog-uid"),
 				},
 				Spec: v1alpha1.CatalogSourceSpec{
-					ConfigMap: "cool-configmap",
+					ConfigMap:  "cool-configmap",
 					SourceType: v1alpha1.SourceTypeConfigmap,
 				},
 			},
@@ -411,7 +413,7 @@ func fakeConfigMapData() map[string]string {
 }
 
 // NewFakeOperator creates a new operator using fake clients
-func NewFakeOperator(clientObjs []runtime.Object, k8sObjs []runtime.Object, extObjs []runtime.Object, regObjs []runtime.Object, resolver resolver.DependencyResolver, namespace string, stopc <- chan struct{}) (*Operator, error) {
+func NewFakeOperator(clientObjs []runtime.Object, k8sObjs []runtime.Object, extObjs []runtime.Object, regObjs []runtime.Object, resolver resolver.DependencyResolver, namespace string, stopc <-chan struct{}) (*Operator, error) {
 	// Create client fakes
 	clientFake := fake.NewSimpleClientset(clientObjs...)
 	opClientFake := operatorclient.NewClient(k8sfake.NewSimpleClientset(k8sObjs...), apiextensionsfake.NewSimpleClientset(extObjs...), apiregistrationfake.NewSimpleClientset(regObjs...))
@@ -431,25 +433,29 @@ func NewFakeOperator(clientObjs []runtime.Object, k8sObjs []runtime.Object, extO
 	podInformer := informerFactory.Core().V1().Pods()
 	configMapInformer := informerFactory.Core().V1().ConfigMaps()
 
+	lister := operatorlister.NewLister()
+	lister.RbacV1().RegisterRoleLister(namespace, roleInformer.Lister())
+	lister.RbacV1().RegisterRoleBindingLister(namespace, roleBindingInformer.Lister())
+	lister.CoreV1().RegisterServiceAccountLister(namespace, serviceAccountInformer.Lister())
+	lister.CoreV1().RegisterServiceLister(namespace, serviceInformer.Lister())
+	lister.CoreV1().RegisterPodLister(namespace, podInformer.Lister())
+	lister.CoreV1().RegisterConfigMapLister(namespace, configMapInformer.Lister())
+
 	// Create the new operator
 	queueOperator, err := queueinformer.NewOperatorFromClient(opClientFake)
 	op := &Operator{
 		Operator:           queueOperator,
 		client:             clientFake,
+		lister:             lister,
 		namespace:          namespace,
 		sources:            make(map[registry.ResourceKey]registry.Source),
 		dependencyResolver: resolver,
 	}
 
 	op.configmapRegistryReconciler = &registry.ConfigMapRegistryReconciler{
-		Image: "test:pod",
+		Image:    "test:pod",
 		OpClient: op.OpClient,
-		RoleLister: roleInformer.Lister(),
-		RoleBindingLister: roleBindingInformer.Lister(),
-		ServiceAccountLister: serviceAccountInformer.Lister(),
-		ServiceLister: serviceInformer.Lister(),
-		PodLister: podInformer.Lister(),
-		ConfigMapLister: configMapInformer.Lister(),
+		Lister:   lister,
 	}
 
 	// register informers for configmapRegistryReconciler
