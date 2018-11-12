@@ -2,7 +2,11 @@ package catalog
 
 import (
 	"errors"
+	"fmt"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/tools/cache"
 	"testing"
+	"time"
 
 	"github.com/ghodss/yaml"
 
@@ -140,6 +144,32 @@ func TestSyncCatalogSources(t *testing.T) {
 		expectedError     error
 	}{
 		{
+			testName:          "CatalogSourceWithInvalidSourceType",
+			operatorNamespace: "cool-namespace",
+			catalogSource: &v1alpha1.CatalogSource{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cool-catalog",
+					Namespace: "cool-namespace",
+					UID:       types.UID("catalog-uid"),
+				},
+				Spec: v1alpha1.CatalogSourceSpec{
+					ConfigMap: "cool-configmap",
+					SourceType: "nope",
+				},
+			},
+			configMap: &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "cool-configmap",
+					Namespace:       "cool-namespace",
+					UID:             types.UID("configmap-uid"),
+					ResourceVersion: "resource-version",
+				},
+				Data: fakeConfigMapData(),
+			},
+			expectedStatus: nil,
+			expectedError: nil,
+		},
+		{
 			testName:          "CatalogSourceWithBackingConfigMap",
 			operatorNamespace: "cool-namespace",
 			catalogSource: &v1alpha1.CatalogSource{
@@ -150,6 +180,7 @@ func TestSyncCatalogSources(t *testing.T) {
 				},
 				Spec: v1alpha1.CatalogSourceSpec{
 					ConfigMap: "cool-configmap",
+					SourceType: v1alpha1.SourceTypeInternal,
 				},
 			},
 			configMap: &corev1.ConfigMap{
@@ -182,6 +213,7 @@ func TestSyncCatalogSources(t *testing.T) {
 				},
 				Spec: v1alpha1.CatalogSourceSpec{
 					ConfigMap: "cool-configmap",
+					SourceType: v1alpha1.SourceTypeConfigmap,
 				},
 				Status: v1alpha1.CatalogSourceStatus{
 					ConfigMapResource: &v1alpha1.ConfigMapResourceReference{
@@ -222,6 +254,7 @@ func TestSyncCatalogSources(t *testing.T) {
 				},
 				Spec: v1alpha1.CatalogSourceSpec{
 					ConfigMap: "cool-configmap",
+					SourceType: v1alpha1.SourceTypeConfigmap,
 				},
 			},
 			configMap: &corev1.ConfigMap{
@@ -234,7 +267,7 @@ func TestSyncCatalogSources(t *testing.T) {
 				Data: map[string]string{},
 			},
 			expectedStatus: nil,
-			expectedError:  errors.New("failed to create catalog source from ConfigMap cool-configmap: error parsing ConfigMap cool-configmap: no valid resources found"),
+			expectedError:  errors.New("error parsing ConfigMap cool-configmap: no valid resources found"),
 		},
 		{
 			testName:          "CatalogSourceWithMissingConfigMap",
@@ -247,21 +280,25 @@ func TestSyncCatalogSources(t *testing.T) {
 				},
 				Spec: v1alpha1.CatalogSourceSpec{
 					ConfigMap: "cool-configmap",
+					SourceType: v1alpha1.SourceTypeConfigmap,
 				},
 			},
 			configMap:      &corev1.ConfigMap{},
 			expectedStatus: nil,
-			expectedError:  errors.New("failed to get catalog config map cool-configmap when updating status: configmaps \"cool-configmap\" not found"),
+			expectedError:  errors.New("failed to get catalog config map cool-configmap: configmap \"cool-configmap\" not found"),
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
+			stopc := make(chan struct{})
+			defer close(stopc)
+
 			// Create existing objects
 			clientObjs := []runtime.Object{tt.catalogSource}
 			k8sObjs := []runtime.Object{tt.configMap}
 
 			// Create test operator
-			op, err := NewFakeOperator(clientObjs, k8sObjs, nil, nil, resolver, tt.operatorNamespace)
+			op, err := NewFakeOperator(clientObjs, k8sObjs, nil, nil, resolver, tt.operatorNamespace, stopc)
 			require.NoError(t, err)
 
 			// Run sync
@@ -373,8 +410,8 @@ func fakeConfigMapData() map[string]string {
 	return data
 }
 
-// NewFakeOprator creates a new operator using fake clients
-func NewFakeOperator(clientObjs []runtime.Object, k8sObjs []runtime.Object, extObjs []runtime.Object, regObjs []runtime.Object, resolver resolver.DependencyResolver, namespace string) (*Operator, error) {
+// NewFakeOperator creates a new operator using fake clients
+func NewFakeOperator(clientObjs []runtime.Object, k8sObjs []runtime.Object, extObjs []runtime.Object, regObjs []runtime.Object, resolver resolver.DependencyResolver, namespace string, stopc <- chan struct{}) (*Operator, error) {
 	// Create client fakes
 	clientFake := fake.NewSimpleClientset(clientObjs...)
 	opClientFake := operatorclient.NewClient(k8sfake.NewSimpleClientset(k8sObjs...), apiextensionsfake.NewSimpleClientset(extObjs...), apiregistrationfake.NewSimpleClientset(regObjs...))
@@ -385,6 +422,15 @@ func NewFakeOperator(clientObjs []runtime.Object, k8sObjs []runtime.Object, extO
 		return nil, err
 	}
 
+	// Creates registry pods in response to configmaps
+	informerFactory := informers.NewSharedInformerFactory(opClientFake.KubernetesInterface(), 5*time.Second)
+	roleInformer := informerFactory.Rbac().V1().Roles()
+	roleBindingInformer := informerFactory.Rbac().V1().RoleBindings()
+	serviceAccountInformer := informerFactory.Core().V1().ServiceAccounts()
+	serviceInformer := informerFactory.Core().V1().Services()
+	podInformer := informerFactory.Core().V1().Pods()
+	configMapInformer := informerFactory.Core().V1().ConfigMaps()
+
 	// Create the new operator
 	queueOperator, err := queueinformer.NewOperatorFromClient(opClientFake)
 	op := &Operator{
@@ -393,6 +439,38 @@ func NewFakeOperator(clientObjs []runtime.Object, k8sObjs []runtime.Object, extO
 		namespace:          namespace,
 		sources:            make(map[registry.ResourceKey]registry.Source),
 		dependencyResolver: resolver,
+	}
+
+	op.configmapRegistryReconciler = &registry.ConfigMapRegistryReconciler{
+		Image: "test:pod",
+		OpClient: op.OpClient,
+		RoleLister: roleInformer.Lister(),
+		RoleBindingLister: roleBindingInformer.Lister(),
+		ServiceAccountLister: serviceAccountInformer.Lister(),
+		ServiceLister: serviceInformer.Lister(),
+		PodLister: podInformer.Lister(),
+		ConfigMapLister: configMapInformer.Lister(),
+	}
+
+	// register informers for configmapRegistryReconciler
+	registryInformers := []cache.SharedIndexInformer{
+		roleInformer.Informer(),
+		roleBindingInformer.Informer(),
+		serviceAccountInformer.Informer(),
+		serviceInformer.Informer(),
+		podInformer.Informer(),
+		configMapInformer.Informer(),
+	}
+
+	var hasSyncedCheckFns []cache.InformerSynced
+	for _, informer := range registryInformers {
+		op.RegisterInformer(informer)
+		hasSyncedCheckFns = append(hasSyncedCheckFns, informer.HasSynced)
+		go informer.Run(stopc)
+	}
+
+	if ok := cache.WaitForCacheSync(stopc, hasSyncedCheckFns...); !ok {
+		return nil, fmt.Errorf("failed to wait for caches to sync")
 	}
 
 	return op, nil
