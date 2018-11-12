@@ -404,7 +404,7 @@ func (a *Operator) syncClusterServiceVersion(obj interface{}) (syncError error) 
 	outCSV, syncError := a.transitionCSVState(*clusterServiceVersion)
 
 	// no changes in status, don't update
-	if outCSV.Status.Phase == clusterServiceVersion.Status.Phase && outCSV.Status.Reason == clusterServiceVersion.Status.Reason && outCSV.Status.Message == clusterServiceVersion.Status.Message {
+	if outCSV.Status.LastUpdateTime == clusterServiceVersion.Status.LastUpdateTime {
 		return
 	}
 
@@ -593,7 +593,7 @@ func (a *Operator) transitionCSVState(in v1alpha1.ClusterServiceVersion) (out *v
 			// we only mark them in this step, in case some get deleted but others fail and break the replacement chain
 			csv.SetPhaseWithEvent(v1alpha1.CSVPhaseDeleting, v1alpha1.CSVReasonReplaced, "has been replaced by a newer ClusterServiceVersion that has successfully installed.", a.recorder)
 			// ignore errors and success here; this step is just an optimization to speed up GC
-			a.client.OperatorsV1alpha1().ClusterServiceVersions(csv.GetNamespace()).UpdateStatus(csv)
+			_, _ = a.client.OperatorsV1alpha1().ClusterServiceVersions(csv.GetNamespace()).UpdateStatus(csv)
 			a.requeueCSV(csv.GetName(), csv.GetNamespace())
 		}
 

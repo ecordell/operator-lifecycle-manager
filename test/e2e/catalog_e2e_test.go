@@ -9,7 +9,7 @@ import (
 	"github.com/coreos/go-semver/semver"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
-	extv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 
@@ -38,13 +38,13 @@ func TestCatalogLoadingBetweenRestarts(t *testing.T) {
 	crdName := crdPlural + ".cluster.com"
 	crd := newCRD(crdName, testNamespace, crdPlural)
 	namedStrategy := newNginxInstallStrategy(genName("dep-"), nil, nil)
-	csv := newCSV(packageStable, testNamespace, "", *semver.New("0.1.0"), []extv1beta1.CustomResourceDefinition{crd}, nil, namedStrategy)
+	csv := newCSV(packageStable, testNamespace, "", *semver.New("0.1.0"), []apiextensions.CustomResourceDefinition{crd}, nil, namedStrategy)
 
 	c := newKubeClient(t)
 	crc := newCRClient(t)
 
 	catalogSourceName := genName("mock-ocs")
-	_, cleanupCatalogSource, err := createInternalCatalogSource(t, c, crc, catalogSourceName, testNamespace, manifests, []extv1beta1.CustomResourceDefinition{crd}, []v1alpha1.ClusterServiceVersion{csv})
+	_, cleanupCatalogSource, err := createInternalCatalogSource(t, c, crc, catalogSourceName, testNamespace, manifests, []apiextensions.CustomResourceDefinition{crd}, []v1alpha1.ClusterServiceVersion{csv})
 	require.NoError(t, err)
 	defer cleanupCatalogSource()
 
@@ -67,14 +67,26 @@ func TestCatalogLoadingBetweenRestarts(t *testing.T) {
 	// check for last synced update to catalogsource
 	t.Log("Checking for catalogsource lastSync updates")
 	_, err = fetchCatalogSource(t, crc, catalogSourceName, testNamespace, func(cs *v1alpha1.CatalogSource) bool {
-		if cs.Status.LastSync.After(catalogSource.Status.LastSync.Time) {
-			t.Logf("lastSync updated: %s -> %s", catalogSource.Status.LastSync, cs.Status.LastSync)
+		if cs.Status.LastSync == catalogSource.Status.LastSync {
+			t.Logf("lastSync the same: %s -> %s", catalogSource.Status.LastSync, cs.Status.LastSync)
 			return true
 		}
 		return false
 	})
-	require.NoError(t, err, "Catalog source never loaded into memory after catalog operator rescale")
+	require.NoError(t, err, "Catalog source changed after rescale")
 	t.Logf("Catalog source sucessfully loaded after rescale")
+}
+
+func grpcCatalogReachable() {
+
+}
+
+func TestCatalogPodUpdatedWhenConfigmapChanged(t *testing.T) {
+	return
+}
+
+func TestCatalogPodRecreatedWhenComponentDeleted(t *testing.T) {
+	return
 }
 
 func getOperatorDeployment(c operatorclient.ClientInterface, operatorLabels labels.Set) (*appsv1.Deployment, error) {

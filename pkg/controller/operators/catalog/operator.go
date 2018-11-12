@@ -7,10 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorlister"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/informers"
-
+	registryclient "github.com/operator-framework/operator-registry/pkg/client"
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -20,7 +17,10 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/informers"
 
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorlister"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/apis/operators/v1alpha1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
@@ -52,10 +52,10 @@ type Operator struct {
 	*queueinformer.Operator
 	client                      versioned.Interface
 	namespace                   string
-	sources                     map[registry.ResourceKey]registry.Source
+	sources                     map[resolver.CatalogKey]registryclient.Interface
 	sourcesLock                 sync.RWMutex
 	sourcesLastUpdate           metav1.Time
-	dependencyResolver          resolver.DependencyResolver
+	resolvers                   map[string]resolver.Resolver
 	subQueue                    workqueue.RateLimitingInterface
 	catSrcQueue                 workqueue.RateLimitingInterface
 	lister                      operatorlister.OperatorLister
@@ -75,6 +75,7 @@ func NewOperator(kubeconfigPath string, wakeupInterval time.Duration, configmapR
 		return nil, err
 	}
 
+	var namespaceResolvers = make(map[string]resolver.Resolver)
 	// Create an informer for each watched namespace.
 	ipSharedIndexInformers := []cache.SharedIndexInformer{}
 	subSharedIndexInformers := []cache.SharedIndexInformer{}
@@ -82,6 +83,7 @@ func NewOperator(kubeconfigPath string, wakeupInterval time.Duration, configmapR
 		nsInformerFactory := externalversions.NewSharedInformerFactoryWithOptions(crClient, wakeupInterval, externalversions.WithNamespace(namespace))
 		ipSharedIndexInformers = append(ipSharedIndexInformers, nsInformerFactory.Operators().V1alpha1().InstallPlans().Informer())
 		subSharedIndexInformers = append(subSharedIndexInformers, nsInformerFactory.Operators().V1alpha1().Subscriptions().Informer())
+		namespaceResolvers[namespace] = resolver.NewNamespaceResolver(namespace, nsInformerFactory)
 	}
 
 	// Create an informer for each catalog namespace
@@ -103,8 +105,8 @@ func NewOperator(kubeconfigPath string, wakeupInterval time.Duration, configmapR
 		client:             crClient,
 		namespace:          operatorNamespace,
 		lister:             operatorlister.NewLister(),
-		sources:            make(map[registry.ResourceKey]registry.Source),
-		dependencyResolver: &resolver.MultiSourceResolver{},
+		sources:            make(map[resolver.CatalogKey]registryclient.Interface),
+		resolvers:          namespaceResolvers,
 	}
 
 	// Register CatalogSource informers.
@@ -249,13 +251,12 @@ func (o *Operator) handleDeletion(obj interface{}) {
 
 		ownee, ok = tombstone.Obj.(metav1.Object)
 		if !ok {
-			utilruntime.HandleError(fmt.Errorf("Tombstone contained object that is not a Namespace %#v", obj))
+			utilruntime.HandleError(fmt.Errorf("Tombstone contained object that is not a metav1 object %#v", obj))
 			return
 		}
 	}
 
-	if ownerutil.IsOwnedByKind(ownee, v1alpha1.CatalogSourceKind) {
-		owner := ownerutil.GetOwnerByKind(ownee, v1alpha1.CatalogSourceKind)
+	if owner := ownerutil.GetOwnerByKind(ownee, v1alpha1.CatalogSourceKind); owner != nil {
 		o.catSrcQueue.AddRateLimited(fmt.Sprintf("%s/%s", ownee.GetNamespace(), owner.Name))
 	}
 }
@@ -290,7 +291,6 @@ func (o *Operator) syncConfigMapSource(logger *log.Entry, catsrc *v1alpha1.Catal
 		return fmt.Errorf("failed to get catalog config map %s: %s", catsrc.Spec.ConfigMap, err)
 	}
 
-	sourceKey := registry.ResourceKey{Name: catsrc.GetName(), Namespace: catsrc.GetNamespace()}
 
 	if catsrc.Status.ConfigMapResource == nil || catsrc.Status.ConfigMapResource.UID != configMap.GetUID() || catsrc.Status.ConfigMapResource.ResourceVersion != configMap.GetResourceVersion() {
 		// configmap ref nonexistant or updated, write out the new configmap ref to status and exit
@@ -303,34 +303,11 @@ func (o *Operator) syncConfigMapSource(logger *log.Entry, catsrc *v1alpha1.Catal
 		}
 		out.Status.LastSync = timeNow()
 
-		// update source map
-		o.sourcesLock.Lock()
-		defer o.sourcesLock.Unlock()
-		src, err := registry.NewInMemoryFromConfigMap(o.OpClient, out.GetNamespace(), out.Spec.ConfigMap)
-		o.sources[sourceKey] = src
-		if err != nil {
-			return err
-		}
-
 		// update status
 		if _, err = o.client.OperatorsV1alpha1().CatalogSources(out.GetNamespace()).UpdateStatus(out); err != nil {
 			return err
 		}
-		o.sourcesLastUpdate = timeNow()
 		return nil
-	}
-
-	// configmap not parsed to memory, but also not out of date
-	if _, ok := o.sources[sourceKey]; !ok {
-		// update source map
-		o.sourcesLock.Lock()
-		defer o.sourcesLock.Unlock()
-		src, err := registry.NewInMemoryFromConfigMap(o.OpClient, catsrc.GetNamespace(), catsrc.Spec.ConfigMap)
-		o.sources[sourceKey] = src
-		if err != nil {
-			return err
-		}
-		o.sourcesLastUpdate = timeNow()
 	}
 
 	// configmap ref is up to date, continue parsing
@@ -355,51 +332,187 @@ func (o *Operator) syncConfigMapSource(logger *log.Entry, catsrc *v1alpha1.Catal
 		return nil
 	}
 
+	// check if client exists
+	sourceKey := resolver.CatalogKey{Name: catsrc.GetName(), Namespace: catsrc.GetNamespace()}
+	var sourceFound bool
+	func() {
+		o.sourcesLock.RLock()
+		defer o.sourcesLock.RUnlock()
+		_, sourceFound = o.sources[sourceKey]
+	}()
+
+	// create client if it doesn't yet exist
+	if !sourceFound {
+		client, err := registryclient.NewClient(catsrc.Status.RegistryServiceStatus.Address())
+		if err != nil {
+			logger.WithError(err).WithField("address", catsrc.Status.RegistryServiceStatus.Address()).Warn("failed to connect to catalog source registry")
+			return err
+		}
+
+		func() {
+			o.sourcesLock.Lock()
+			defer o.sourcesLock.Unlock()
+			o.sources[sourceKey] = client
+		}()
+	}
+
+	// TODO: health check source
+
 	// no updates
 	return nil
 }
 
-func (o *Operator) syncSubscriptions(obj interface{}) (syncError error) {
+func (o *Operator) syncSubscriptions(obj interface{}) error {
 	sub, ok := obj.(*v1alpha1.Subscription)
 	if !ok {
 		log.Debugf("wrong type: %#v", obj)
 		return fmt.Errorf("casting Subscription failed")
 	}
+	namespace := sub.GetNamespace()
 
-	logger := log.WithFields(log.Fields{
-		"sub":       sub.GetName(),
-		"namespace": sub.GetNamespace(),
-		"source":    sub.Spec.CatalogSource,
-		"pkg":       sub.Spec.Package,
-		"channel":   sub.Spec.Channel,
-	})
-
-	logger.Infof("syncing")
-
-	var updatedSub *v1alpha1.Subscription
-	updatedSub, syncError = o.syncSubscription(sub)
-
-	if updatedSub == nil || updatedSub.Status.State == sub.Status.State {
-		return
+	if err := o.ensureSubscriptionCSVState(sub); err!=nil {
+		return err
 	}
-	if syncError != nil {
-		logger = logger.WithField("syncError", syncError)
+
+	if !o.shouldUpdateSubscription(sub) {
+		return nil
 	}
-	updatedSub.Status.LastUpdated = timeNow()
+
+	nsResolver := o.resolvers[namespace]
+
+	//TODO: double check if this lock is still needed
+	o.sourcesLock.RLock()
+	defer o.sourcesLock.RUnlock()
+
+	steps, subs, err := nsResolver.ResolveSteps(resolver.NewNamespaceSourceQuerier(o.sources))
+	if err != nil {
+		return err
+	}
+
+	installPlanApproval := v1alpha1.ApprovalAutomatic
+	for _, sub := range subs {
+		if sub.Spec.InstallPlanApproval == v1alpha1.ApprovalManual {
+			installPlanApproval = v1alpha1.ApprovalManual
+			break
+		}
+	}
+
+	installplanReference, err := o.createInstallPlan(namespace, installPlanApproval, steps)
+	if err!=nil {
+		return err
+	}
+
+	if err := o.ensureSubscriptionInstallPlanState(namespace, subs, installplanReference); err!=nil {
+		return err
+	}
+	return nil
+}
+
+func (o *Operator) shouldUpdateSubscription(sub *v1alpha1.Subscription) bool {
+	// Only sync if catalog has been updated since last sync time
+	if o.sourcesLastUpdate.Before(&sub.Status.LastUpdated) && sub.Status.State == v1alpha1.SubscriptionStateAtLatest {
+		log.Infof("skipping update: no new updates to catalog since last sync at %s", sub.Status.LastUpdated.String())
+		return false
+	}
+	if sub.Status.Install != nil && sub.Status.State == v1alpha1.SubscriptionStateUpgradePending {
+		log.Infof("skipping update: installplan already created")
+		return false
+	}
+	return true
+}
+
+func (o *Operator) ensureSubscriptionCSVState(sub *v1alpha1.Subscription) error {
+	// TODO pull from cache
+	csv, err := o.client.OperatorsV1alpha1().ClusterServiceVersions(sub.GetNamespace()).Get(sub.Status.CurrentCSV, metav1.GetOptions{})
+	out := sub.DeepCopy()
+	if err != nil || csv == nil {
+		out.Status.State = v1alpha1.SubscriptionStateUpgradePending
+	} else {
+		out.Status.State = v1alpha1.SubscriptionStateAtLatest
+	}
+
+	if sub.Status == out.Status {
+		// The subscription status represents the cluster state
+		return nil
+	}
+	out.Status.LastUpdated = timeNow()
 
 	// Update Subscription with status of transition. Log errors if we can't write them to the status.
-	if _, err := o.client.OperatorsV1alpha1().Subscriptions(updatedSub.GetNamespace()).UpdateStatus(updatedSub); err != nil {
-		logger = logger.WithField("updateError", err.Error())
-		updateErr := errors.New("error updating Subscription status: " + err.Error())
-		if syncError == nil {
-			logger.Info("error updating Subscription status")
-			return updateErr
-		}
-		logger.Info("error transitioning Subscription")
-		syncError = fmt.Errorf("error transitioning Subscription: %s and error updating Subscription status: %s", syncError, updateErr)
+	if sub, err = o.client.OperatorsV1alpha1().Subscriptions(out.GetNamespace()).UpdateStatus(out); err != nil {
+		log.WithError(err).Info("error updating subscription status")
+		return fmt.Errorf("error updating Subscription status: " + err.Error())
 	}
 
-	return
+	// subscription status represents cluster state
+	return nil
+}
+
+func (o *Operator) ensureSubscriptionInstallPlanState(namespace string, subs []*v1alpha1.Subscription, installPlanRef *v1alpha1.InstallPlanReference) error {
+	//TODO parallel, sync waitgroup
+	for _, sub := range subs {
+		sub.Status.Install = installPlanRef
+		if _, err := o.client.OperatorsV1alpha1().Subscriptions(namespace).UpdateStatus(sub); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (o *Operator) createInstallPlan(namespace string, installPlanApproval v1alpha1.Approval, steps []*v1alpha1.Step) (*v1alpha1.InstallPlanReference, error) {
+	if len(steps) == 0 {
+		return nil, nil
+	}
+
+	csvNames := []string{}
+	catalogSourceMap := map[string]struct{}{}
+	for _, s := range steps {
+		if s.Resource.Kind == "ClusterServiceVersion" {
+			csvNames = append(csvNames, s.Resource.Name)
+		}
+		catalogSourceMap[s.Resource.CatalogSource] = struct{}{}
+	}
+	catalogSources := []string{}
+	for s := range catalogSourceMap {
+		catalogSources = append(catalogSources, s)
+	}
+
+	phase := v1alpha1.InstallPlanPhaseInstalling
+	if installPlanApproval == v1alpha1.ApprovalManual {
+		phase = v1alpha1.InstallPlanPhaseRequiresApproval
+	}
+	ip := &v1alpha1.InstallPlan{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "install-",
+			Namespace: namespace,
+		},
+		Spec: v1alpha1.InstallPlanSpec{
+			ClusterServiceVersionNames: csvNames,
+			Approval:                   installPlanApproval,
+			Approved:                   installPlanApproval == v1alpha1.ApprovalAutomatic,
+		},
+	}
+
+	res, err := o.client.OperatorsV1alpha1().InstallPlans(namespace).Create(ip)
+	if err != nil {
+		return nil, err
+	}
+
+	res.Status = v1alpha1.InstallPlanStatus{
+		Phase: phase,
+		Plan: steps,
+		CatalogSources: catalogSources,
+	}
+	res, err = o.client.OperatorsV1alpha1().InstallPlans(namespace).UpdateStatus(res)
+	if err != nil {
+		return nil, err
+	}
+	return &v1alpha1.InstallPlanReference{
+		UID:        res.GetUID(),
+		Name:       res.GetName(),
+		APIVersion: v1alpha1.SchemeGroupVersion.String(),
+		Kind:       v1alpha1.InstallPlanKind,
+	}, nil
+
 }
 
 func (o *Operator) requeueInstallPlan(name, namespace string) {
@@ -471,28 +584,6 @@ func transitionInstallPlanState(transitioner installPlanTransitioner, in v1alpha
 	out := in.DeepCopy()
 
 	switch in.Status.Phase {
-	case v1alpha1.InstallPlanPhaseNone:
-		logger.Debugf("setting phase to %s", v1alpha1.InstallPlanPhasePlanning)
-		out.Status.Phase = v1alpha1.InstallPlanPhasePlanning
-		return out, nil
-
-	case v1alpha1.InstallPlanPhasePlanning:
-		logger.Debug("attempting to resolve")
-		if err := transitioner.ResolvePlan(out); err != nil {
-			out.Status.SetCondition(v1alpha1.ConditionFailed(v1alpha1.InstallPlanResolved,
-				v1alpha1.InstallPlanReasonInstallCheckFailed, err))
-			out.Status.Phase = v1alpha1.InstallPlanPhaseFailed
-			return out, err
-		}
-		out.Status.SetCondition(v1alpha1.ConditionMet(v1alpha1.InstallPlanResolved))
-
-		if out.Spec.Approval == v1alpha1.ApprovalManual && out.Spec.Approved != true {
-			out.Status.Phase = v1alpha1.InstallPlanPhaseRequiresApproval
-		} else {
-			out.Status.Phase = v1alpha1.InstallPlanPhaseInstalling
-		}
-		return out, nil
-
 	case v1alpha1.InstallPlanPhaseRequiresApproval:
 		if out.Spec.Approved {
 			logger.Debugf("approved, setting to %s", v1alpha1.InstallPlanPhasePlanning)
@@ -520,74 +611,6 @@ func transitionInstallPlanState(transitioner installPlanTransitioner, in v1alpha
 
 // ResolvePlan modifies an InstallPlan to contain a Plan in its Status field.
 func (o *Operator) ResolvePlan(plan *v1alpha1.InstallPlan) error {
-	if plan.Status.Phase != v1alpha1.InstallPlanPhasePlanning {
-		panic("attempted to create a plan that wasn't in the planning phase")
-	}
-
-	if len(o.sources) == 0 {
-		return fmt.Errorf("cannot resolve InstallPlan without any Catalog Sources")
-	}
-
-	// Take a snapshot of the included catalog sources
-	includedNamespaces := map[string]struct{}{
-		o.namespace:    {},
-		plan.Namespace: {},
-	}
-	sourcesSnapshot := o.getSourcesSnapshot(plan, includedNamespaces)
-
-	// Take a snapshot of the existing CRD owners
-	existingCRDOwners, err := o.getExistingCRDOwners(plan.Namespace)
-	if err != nil {
-		return err
-	}
-
-	// Attempt to resolve the InstallPlan
-	steps, usedSources, err := o.dependencyResolver.ResolveInstallPlan(sourcesSnapshot, existingCRDOwners, CatalogLabel, plan)
-	if err != nil {
-		return err
-	}
-
-	// Set the resolved steps
-	plan.Status.Plan = steps
-	plan.Status.CatalogSources = []string{}
-
-	// Add secrets for each used catalog source
-	for _, sourceKey := range usedSources {
-		// Append the used catalog source
-		plan.Status.CatalogSources = append(plan.Status.CatalogSources, sourceKey.Name)
-
-		// Get the catalog source
-		catsrc, err := o.client.OperatorsV1alpha1().CatalogSources(sourceKey.Namespace).Get(sourceKey.Name, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-
-		for _, secretName := range catsrc.Spec.Secrets {
-			// Attempt to look up the secret
-			_, err := o.OpClient.KubernetesInterface().CoreV1().Secrets(sourceKey.Namespace).Get(secretName, metav1.GetOptions{})
-			status := v1alpha1.StepStatusUnknown
-			if k8serrors.IsNotFound(err) {
-				status = v1alpha1.StepStatusNotPresent
-			} else if err == nil {
-				status = v1alpha1.StepStatusPresent
-			} else {
-				return err
-			}
-
-			// Prepend any required secrets to the plan for that catalog source
-			plan.Status.Plan = append([]*v1alpha1.Step{{
-				Resolving: "",
-				Resource: v1alpha1.StepResource{
-					Name:    secretName,
-					Kind:    "Secret",
-					Group:   "",
-					Version: "v1",
-				},
-				Status: status,
-			}}, plan.Status.Plan...)
-		}
-	}
-
 	return nil
 }
 
@@ -600,7 +623,7 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 	// Get the set of initial installplan csv names
 	initialCSVNames := getCSVNameSet(plan)
 	// Get pre-existing CRD owners to make decisions about applying resolved CSVs
-	existingCRDOwners, err := o.getExistingCRDOwners(plan.GetNamespace())
+	existingCRDOwners, err := o.getExistingApiOwners(plan.GetNamespace())
 	if err != nil {
 		return err
 	}
@@ -656,7 +679,7 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 					// TODO: decide on fail/continue logic for pre-existing dependent CSVs that own the same CRD(s)
 					if competingOwners {
 						// For now, error out
-						return fmt.Errorf("Pre-existing CRD owners found for owned CRD(s) of dependent CSV %s", csv.GetName())
+						return fmt.Errorf("pre-existing CRD owners found for owned CRD(s) of dependent CSV %s", csv.GetName())
 					}
 				}
 
@@ -882,33 +905,8 @@ func (o *Operator) ExecutePlan(plan *v1alpha1.InstallPlan) error {
 	return nil
 }
 
-func (o *Operator) getSourcesSnapshot(plan *v1alpha1.InstallPlan, includedNamespaces map[string]struct{}) []registry.SourceRef {
-	o.sourcesLock.RLock()
-	defer o.sourcesLock.RUnlock()
-	sourcesSnapshot := []registry.SourceRef{}
-
-	for key, source := range o.sources {
-		// Only copy catalog sources in included namespaces
-		if _, ok := includedNamespaces[key.Namespace]; ok {
-			ref := registry.SourceRef{
-				Source:    source,
-				SourceKey: key,
-			}
-			if key.Name == plan.Spec.CatalogSource && key.Namespace == plan.Spec.CatalogSourceNamespace {
-				// Prepend preffered catalog source
-				sourcesSnapshot = append([]registry.SourceRef{ref}, sourcesSnapshot...)
-			} else {
-				// Append the catalog source
-				sourcesSnapshot = append(sourcesSnapshot, ref)
-			}
-		}
-	}
-
-	return sourcesSnapshot
-}
-
-// getExistingCRDOwners creates a map of CRD names to existing owner CSVs in the given namespace
-func (o *Operator) getExistingCRDOwners(namespace string) (map[string][]string, error) {
+// getExistingApiOwners creates a map of CRD names to existing owner CSVs in the given namespace
+func (o *Operator) getExistingApiOwners(namespace string) (map[string][]string, error) {
 	// Get a list of CSV CRs in the namespace
 	csvList, err := o.client.OperatorsV1alpha1().ClusterServiceVersions(namespace).List(metav1.ListOptions{})
 
@@ -921,6 +919,9 @@ func (o *Operator) getExistingCRDOwners(namespace string) (map[string][]string, 
 	for _, csv := range csvList.Items {
 		for _, crd := range csv.Spec.CustomResourceDefinitions.Owned {
 			owners[crd.Name] = append(owners[crd.Name], csv.GetName())
+		}
+		for _, api := range csv.Spec.APIServiceDefinitions.Owned {
+			owners[api.Group] = append(owners[api.Group], csv.GetName())
 		}
 	}
 

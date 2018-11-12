@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/runtime"
+
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/apis/operators/v1alpha1"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/install"
@@ -16,7 +18,7 @@ import (
 	"k8s.io/api/core/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	extv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	"k8s.io/apimachinery/pkg/api/errors"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -68,8 +70,16 @@ func buildCRDCleanupFunc(c operatorclient.ClientInterface, crdName string) clean
 	}
 }
 
-func createCRD(c operatorclient.ClientInterface, crd extv1beta1.CustomResourceDefinition) (cleanupFunc, error) {
-	_, err := c.ApiextensionsV1beta1Interface().ApiextensionsV1beta1().CustomResourceDefinitions().Create(&crd)
+func createCRD(c operatorclient.ClientInterface, crd apiextensions.CustomResourceDefinition) (cleanupFunc, error) {
+	out := &apiextensions.CustomResourceDefinition{}
+	scheme := runtime.NewScheme()
+	if err := apiextensions.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+	if err := scheme.Convert(&crd, out, nil); err != nil {
+		return nil, err
+	}
+	_, err := c.ApiextensionsV1beta1Interface().ApiextensionsV1beta1().CustomResourceDefinitions().Create(out)
 	if err != nil {
 		return nil, err
 	}
@@ -281,14 +291,14 @@ func TestCreateCSVWithUnmetPermissionsCRD(t *testing.T) {
 	}
 
 	// Create dependency first (CRD)
-	cleanupCRD, err := createCRD(c, extv1beta1.CustomResourceDefinition{
+	cleanupCRD, err := createCRD(c, apiextensions.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: crdName,
 		},
-		Spec: extv1beta1.CustomResourceDefinitionSpec{
+		Spec: apiextensions.CustomResourceDefinitionSpec{
 			Group:   "cluster.com",
 			Version: "v1alpha1",
-			Names: extv1beta1.CustomResourceDefinitionNames{
+			Names: apiextensions.CustomResourceDefinitionNames{
 				Plural:   crdPlural,
 				Singular: crdPlural,
 				Kind:     crdPlural,
@@ -531,14 +541,14 @@ func TestCreateCSVRequirementsMetCRD(t *testing.T) {
 	}
 
 	// Create dependency first (CRD)
-	crd := extv1beta1.CustomResourceDefinition{
+	crd := apiextensions.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: crdName,
 		},
-		Spec: extv1beta1.CustomResourceDefinitionSpec{
+		Spec: apiextensions.CustomResourceDefinitionSpec{
 			Group:   "cluster.com",
 			Version: "v1alpha1",
-			Names: extv1beta1.CustomResourceDefinitionNames{
+			Names: apiextensions.CustomResourceDefinitionNames{
 				Plural:   crdPlural,
 				Singular: crdPlural,
 				Kind:     crdPlural,
@@ -1039,14 +1049,14 @@ func TestUpdateCSVSameDeploymentName(t *testing.T) {
 	// Create dependency first (CRD)
 	crdPlural := genName("ins")
 	crdName := crdPlural + ".cluster.com"
-	cleanupCRD, err := createCRD(c, extv1beta1.CustomResourceDefinition{
+	cleanupCRD, err := createCRD(c, apiextensions.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: crdName,
 		},
-		Spec: extv1beta1.CustomResourceDefinitionSpec{
+		Spec: apiextensions.CustomResourceDefinitionSpec{
 			Group:   "cluster.com",
 			Version: "v1alpha1",
-			Names: extv1beta1.CustomResourceDefinitionNames{
+			Names: apiextensions.CustomResourceDefinitionNames{
 				Plural:   crdPlural,
 				Singular: crdPlural,
 				Kind:     crdPlural,
@@ -1186,14 +1196,14 @@ func TestUpdateCSVDifferentDeploymentName(t *testing.T) {
 	// Create dependency first (CRD)
 	crdPlural := genName("ins2")
 	crdName := crdPlural + ".cluster.com"
-	cleanupCRD, err := createCRD(c, extv1beta1.CustomResourceDefinition{
+	cleanupCRD, err := createCRD(c, apiextensions.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: crdName,
 		},
-		Spec: extv1beta1.CustomResourceDefinitionSpec{
+		Spec: apiextensions.CustomResourceDefinitionSpec{
 			Group:   "cluster.com",
 			Version: "v1alpha1",
-			Names: extv1beta1.CustomResourceDefinitionNames{
+			Names: apiextensions.CustomResourceDefinitionNames{
 				Plural:   crdPlural,
 				Singular: crdPlural,
 				Kind:     crdPlural,
@@ -1331,20 +1341,20 @@ func TestUpdateCSVMultipleIntermediates(t *testing.T) {
 	// Create dependency first (CRD)
 	crdPlural := genName("ins3")
 	crdName := crdPlural + ".cluster.com"
-	cleanupCRD, err := createCRD(c, extv1beta1.CustomResourceDefinition{
+	cleanupCRD, err := createCRD(c, apiextensions.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: crdName,
 		},
-		Spec: extv1beta1.CustomResourceDefinitionSpec{
+		Spec: apiextensions.CustomResourceDefinitionSpec{
 			Group: "cluster.com",
-			Versions: []extv1beta1.CustomResourceDefinitionVersion{
+			Versions: []apiextensions.CustomResourceDefinitionVersion{
 				{
 					Name:    "v1alpha1",
 					Served:  true,
 					Storage: true,
 				},
 			},
-			Names: extv1beta1.CustomResourceDefinitionNames{
+			Names: apiextensions.CustomResourceDefinitionNames{
 				Plural:   crdPlural,
 				Singular: crdPlural,
 				Kind:     crdPlural,
@@ -1482,13 +1492,13 @@ func TestUpdateCSVMultipleVersionCRD(t *testing.T) {
 	// Create initial CRD which has 2 versions: v1alpha1 & v1alpha2
 	crdPlural := genName("ins4")
 	crdName := crdPlural + ".cluster.com"
-	cleanupCRD, err := createCRD(c, extv1beta1.CustomResourceDefinition{
+	cleanupCRD, err := createCRD(c, apiextensions.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: crdName,
 		},
-		Spec: extv1beta1.CustomResourceDefinitionSpec{
+		Spec: apiextensions.CustomResourceDefinitionSpec{
 			Group: "cluster.com",
-			Versions: []extv1beta1.CustomResourceDefinitionVersion{
+			Versions: []apiextensions.CustomResourceDefinitionVersion{
 				{
 					Name:    "v1alpha1",
 					Served:  true,
@@ -1500,7 +1510,7 @@ func TestUpdateCSVMultipleVersionCRD(t *testing.T) {
 					Storage: false,
 				},
 			},
-			Names: extv1beta1.CustomResourceDefinitionNames{
+			Names: apiextensions.CustomResourceDefinitionNames{
 				Plural:   crdPlural,
 				Singular: crdPlural,
 				Kind:     crdPlural,
