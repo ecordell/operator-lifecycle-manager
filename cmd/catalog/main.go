@@ -80,7 +80,7 @@ func main() {
 	go http.ListenAndServe(":8080", nil)
 
 	// Create a new instance of the operator.
-	catalogOperator, err := catalog.NewOperator(*kubeConfigPath, log.New(), *wakeupInterval, *catalogNamespace, namespaces...)
+	catalogOperator, err := catalog.NewOperator(*kubeConfigPath, log.New(), *wakeupInterval, *configmapServerImage, *catalogNamespace, namespaces...)
 	if err != nil {
 		log.Panicf("error configuring operator: %s", err.Error())
 	}
