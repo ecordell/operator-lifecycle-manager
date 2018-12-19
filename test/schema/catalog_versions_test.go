@@ -75,7 +75,7 @@ func resolveCatalogs(t *testing.T, catalogs []registry.SourceRef, dependencyReso
 		t.Logf("Resolving CSVs for catalog source %s...", catalog.SourceKey.Name)
 
 		// Get CSV names
-		csvs, err := catalog.Source.ListServices()
+		csvs, err := catalog.SourceClient.ListServices()
 		if err != nil {
 			return err
 		}
@@ -167,7 +167,7 @@ func VerifyCatalogVersions(t *testing.T, manifestDir string) {
 						Name:      loadedCatalog.Name,
 						Namespace: "default", // namespace is irrelevant (everything is loaded from files)
 					},
-					Source: loadedCatalog.Registry,
+					SourceClient: loadedCatalog.Registry,
 				}
 				catalogVersionBundles[loadedCatalog.Version] = append(catalogVersionBundles[loadedCatalog.Version], sourceRef)
 			}

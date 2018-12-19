@@ -11,7 +11,7 @@ import (
 	"github.com/ghodss/yaml"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,8 +35,8 @@ const (
 
 	etcdVersion            = "3.2.13"
 	prometheusVersion      = "v2.3.2"
-	expectedEtcdNodes      = 3
-	expectedPrometheusSize = 3
+	expectedEtcdNodes      = 1
+	expectedPrometheusSize = 1
 	ocsConfigMap           = "rh-operators"
 	olmConfigMap           = "olm-operators"
 	packageServerCSV       = "packageserver.v1.0.0"
@@ -281,7 +281,7 @@ func buildServiceAccountCleanupFunc(t *testing.T, c operatorclient.ClientInterfa
 	}
 }
 
-func createInternalCatalogSource(t *testing.T, c operatorclient.ClientInterface, crc versioned.Interface, name, namespace string, manifests []registry.PackageManifest, crds []v1beta1.CustomResourceDefinition, csvs []v1alpha1.ClusterServiceVersion) (*v1alpha1.CatalogSource, cleanupFunc, error) {
+func createInternalCatalogSource(t *testing.T, c operatorclient.ClientInterface, crc versioned.Interface, name, namespace string, manifests []registry.PackageManifest, crds []apiextensions.CustomResourceDefinition, csvs []v1alpha1.ClusterServiceVersion) (*v1alpha1.CatalogSource, cleanupFunc, error) {
 	// Create a config map containing the PackageManifests and CSVs
 	configMapName := fmt.Sprintf("%s-configmap", name)
 	catalogConfigMap := &corev1.ConfigMap{

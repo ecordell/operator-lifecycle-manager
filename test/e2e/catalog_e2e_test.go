@@ -9,6 +9,7 @@ import (
 	"github.com/coreos/go-semver/semver"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	extv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -39,7 +40,7 @@ func TestCatalogLoadingBetweenRestarts(t *testing.T) {
 	crdName := crdPlural + ".cluster.com"
 	crd := newCRD(crdName, crdPlural)
 	namedStrategy := newNginxInstallStrategy(genName("dep-"), nil, nil)
-	csv := newCSV(packageStable, testNamespace, "", *semver.New("0.1.0"), []extv1beta1.CustomResourceDefinition{crd}, nil, namedStrategy)
+	csv := newCSV(packageStable, testNamespace, "", *semver.New("0.1.0"), []apiextensions.CustomResourceDefinition{crd}, nil, namedStrategy)
 
 	c := newKubeClient(t)
 	crc := newCRClient(t)
@@ -73,12 +74,24 @@ func TestCatalogLoadingBetweenRestarts(t *testing.T) {
 		}
 		return false
 	})
-	require.NoError(t, err, "Catalog source never loaded into memory after catalog operator rescale")
+	require.NoError(t, err, "Catalog source changed after rescale")
 	t.Logf("Catalog source sucessfully loaded after rescale")
 }
 
-func getOperatorDeployment(c operatorclient.ClientInterface, namespace string, operatorLabels labels.Set) (*appsv1.Deployment, error) {
-	deployments, err := c.ListDeploymentsWithLabels(namespace, operatorLabels)
+func grpcCatalogReachable() {
+
+}
+
+func TestCatalogPodUpdatedWhenConfigmapChanged(t *testing.T) {
+	t.Fail()
+}
+
+func TestCatalogPodRecreatedWhenComponentDeleted(t *testing.T) {
+	t.Fail()
+}
+
+func getOperatorDeployment(c operatorclient.ClientInterface, operatorLabels labels.Set) (*appsv1.Deployment, error) {
+	deployments, err := c.ListDeploymentsWithLabels(testNamespace, operatorLabels)
 	if err != nil || deployments == nil || len(deployments.Items) != 1 {
 		return nil, fmt.Errorf("Error getting single operator deployment for label: %v", operatorLabels)
 	}

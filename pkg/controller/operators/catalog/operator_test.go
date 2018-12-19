@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ghodss/yaml"
+	"github.com/operator-framework/operator-registry/pkg/client"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -135,8 +136,6 @@ func TestTransitionInstallPlan(t *testing.T) {
 }
 
 func TestSyncCatalogSources(t *testing.T) {
-	resolver := &resolver.MultiSourceResolver{}
-
 	tests := []struct {
 		testName          string
 		operatorNamespace string
@@ -299,7 +298,7 @@ func TestSyncCatalogSources(t *testing.T) {
 			// Create test operator
 			stopCh := make(chan struct{})
 			defer func() { stopCh <- struct{}{} }()
-			op, _, err := NewFakeOperator(clientObjs, k8sObjs, nil, nil, resolver, tt.operatorNamespace, stopCh)
+			op, _, err := NewFakeOperator(clientObjs, k8sObjs, nil, nil, tt.operatorNamespace, stopCh)
 			require.NoError(t, err)
 
 			// Run sync
@@ -320,7 +319,7 @@ func TestSyncCatalogSources(t *testing.T) {
 				require.Equal(t, *tt.expectedStatus.ConfigMapResource, *updated.Status.ConfigMapResource)
 
 				// Ensure that the catalog source has been loaded into memory
-				_, ok := op.sources[registry.ResourceKey{Name: tt.catalogSource.GetName(), Namespace: tt.catalogSource.GetNamespace()}]
+				_, ok := op.sources[resolver.CatalogKey{Name: tt.catalogSource.GetName(), Namespace: tt.catalogSource.GetNamespace()}]
 				require.True(t, ok, "Expected catalog was not loaded into memory")
 			}
 		})
@@ -412,7 +411,7 @@ func fakeConfigMapData() map[string]string {
 }
 
 // NewFakeOprator creates a new operator using fake clients
-func NewFakeOperator(clientObjs []runtime.Object, k8sObjs []runtime.Object, extObjs []runtime.Object, regObjs []runtime.Object, resolver resolver.DependencyResolver, namespace string, stopCh <-chan struct{}) (*Operator, []cache.InformerSynced, error) {
+func NewFakeOperator(clientObjs []runtime.Object, k8sObjs []runtime.Object, extObjs []runtime.Object, regObjs []runtime.Object, namespace string, stopCh <-chan struct{}) (*Operator, []cache.InformerSynced, error) {
 	// Create client fakes
 	clientFake := fake.NewSimpleClientset(clientObjs...)
 	opClientFake := operatorclient.NewClient(k8sfake.NewSimpleClientset(k8sObjs...), apiextensionsfake.NewSimpleClientset(extObjs...), apiregistrationfake.NewSimpleClientset(regObjs...))
@@ -460,12 +459,12 @@ func NewFakeOperator(clientObjs []runtime.Object, k8sObjs []runtime.Object, extO
 	// Create the new operator
 	queueOperator, err := queueinformer.NewOperatorFromClient(opClientFake, logrus.New())
 	op := &Operator{
-		Operator:           queueOperator,
-		client:             clientFake,
-		lister:             lister,
-		namespace:          namespace,
-		sources:            make(map[registry.ResourceKey]registry.Source),
-		dependencyResolver: resolver,
+		Operator:  queueOperator,
+		client:    clientFake,
+		lister:    lister,
+		namespace: namespace,
+		sources:   make(map[resolver.CatalogKey]client.Interface),
+		//TODO: resolvers
 	}
 
 	op.configmapRegistryReconciler = &registry.ConfigMapRegistryReconciler{
