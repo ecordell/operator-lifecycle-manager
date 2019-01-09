@@ -131,6 +131,7 @@ type ClusterServiceVersionSpec struct {
 	CustomResourceDefinitions CustomResourceDefinitions `json:"customresourcedefinitions,omitempty"`
 	APIServiceDefinitions     APIServiceDefinitions     `json:"apiservicedefinitions,omitempty"`
 	NativeAPIs                []metav1.GroupVersionKind `json:"nativeAPIs,omitempty"`
+	MinKubeVersion            string                    `json:"minKubeVersion,omitempty"`
 	DisplayName               string                    `json:"displayName"`
 	Description               string                    `json:"description,omitempty"`
 	Keywords                  []string                  `json:"keywords,omitempty"`
@@ -472,3 +473,4 @@ func (csv ClusterServiceVersion) GetOwnedAPIServiceDescriptions() []APIServiceDe
 
 	return descs
 }
+
