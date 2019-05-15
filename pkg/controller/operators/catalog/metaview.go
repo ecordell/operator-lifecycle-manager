@@ -9,9 +9,7 @@ import (
 
 // metaViewer is a transparent viewer that can be used as a basis for more complex viewers.
 // It holds a set of commonly used utilities.
-// TODO: we probably don't want to embed Operator.
 type metaViewer struct {
-	*Operator
 	now       func() metav1.Time
 	namespace string
 }
@@ -45,11 +43,9 @@ func withNamespace(namespace string) metaViewerOption {
 }
 
 // newMetaViewer returns a new metaViewer.
-func newMetaViewer(op *Operator, options ...metaViewerOption) *metaViewer {
+func newMetaViewer(options ...metaViewerOption) *metaViewer {
 	viewer := &metaViewer{
-		Operator:  op,
-		now:       timeNow,
-		namespace: op.namespace,
+		now: timeNow,
 	}
 
 	for _, option := range options {

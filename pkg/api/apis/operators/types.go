@@ -1,16 +1,18 @@
-package v1alpha1
+package operators
 
 import (
 	"fmt"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/cache"
 )
 
-const (
-	CatalogSourceCRDAPIVersion = GroupName + "/" + GroupVersion
-	CatalogSourceKind          = "CatalogSource"
-)
+type Icon struct {
+	Data      string `json:"base64data"`
+	MediaType string `json:"mediatype"`
+}
 
 // SourceType indicates the type of backing store for a CatalogSource
 type SourceType string
@@ -91,6 +93,7 @@ type ConfigMapResourceReference struct {
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +genclient
 type CatalogSource struct {
+	cache.ViewMeta
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata"`
 

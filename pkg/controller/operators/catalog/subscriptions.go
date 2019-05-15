@@ -12,7 +12,8 @@ import (
 
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/apis/operators"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/apis/operators/v1alpha1"
-	"k8s.io/apimachinery/pkg/labels"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/reconciler"
+	"github.com/operator-framework/operator-lifecycle-manager/pkg/lib/operatorlister"
 )
 
 var (
@@ -65,8 +66,12 @@ func ensureLabels(sub *v1alpha1.Subscription) *v1alpha1.Subscription {
 // subCatViewer implements the SubscriptionCatalogStatus view over CatalogSources.
 type subCatViewer struct {
 	*metaViewer
-	getReference func(obj runtime.Object) (*corev1.ObjectReference, error)
-	namespace    string
+	reconciler             reconciler.RegistryReconcilerFactory
+	getReference           func(obj runtime.Object) (*corev1.ObjectReference, error)
+	namespace              string
+	globalCatalogNamespace string
+	watchedNamespaces      []string
+	lister                 operatorlister.CoreV1Lister
 }
 
 type subCatViewerOption func(*subCatViewer)
@@ -79,7 +84,7 @@ func withMetaViewerOptions(options ...metaViewerOption) subCatViewerOption {
 	}
 }
 
-// newSubCatViewer returns a Viewer that produces SubscriptionCatalogStatues from CatalogSources.
+// newSubCatViewer returns a Viewer that produces SubscriptionCatalogStatuses from CatalogSources.
 func newSubCatViewer(mv *metaViewer, options ...subCatViewerOption) *subCatViewer {
 	// Set defaults
 	viewer := &subCatViewer{
@@ -160,20 +165,22 @@ func (viewer *subCatViewer) subCatViewIndex(view interface{}) ([]string, error) 
 		return []string{}, nil
 	}
 
-	if scs.CatalogSourceRef.Namespace == viewer.Operator.namespace {
+	if scs.CatalogSourceRef.Namespace == viewer.globalCatalogNamespace {
 		// The CatalogSource is global, get keys for subscriptions in all watched namespaces
 		namespaces := viewer.watchedNamespaces
-		if len(namespaces) == 1 && namespaces[0] == metav1.NamespaceAll {
-			// Need to get all namespace names
-			nsList, err := viewer.lister.CoreV1().NamespaceLister().List(labels.Everything())
-			if err != nil {
-				return nil, err
-			}
-			namespaces = make([]string, len(nsList))
-			for i, ns := range nsList {
-				namespaces[i] = ns.GetName()
-			}
-		}
+
+		// Why?
+		// if len(namespaces) == 1 && namespaces[0] == metav1.NamespaceAll {
+		// 	// Need to get all namespace names
+		// 	nsList, err := viewer.lister.CoreV1().NamespaceLister().List(labels.Everything())
+		// 	if err != nil {
+		// 		return nil, err
+		// 	}
+		// 	namespaces = make([]string, len(nsList))
+		// 	for i, ns := range nsList {
+		// 		namespaces[i] = ns.GetName()
+		// 	}
+		// }
 
 		keySet := sets.String{}
 		for _, namespace := range namespaces {

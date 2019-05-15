@@ -186,8 +186,10 @@ func NewOperator(kubeconfigPath string, logger *logrus.Logger, wakeupInterval ti
 		// Set up viewers
 		mv := newMetaViewer(op, withNamespace(namespace))
 		scv := newSubCatViewer(mv)
-		scvKey := opcache.NewViewerKey(subCatIndexKey, new(v1alpha1.CatalogSource), new(v1alpha1.SubscriptionCatalogStatus))
-		viewIndexer.AddViewer(scvKey, scv)
+		scvKey := opcache.ViewerKey(subCatIndexKey)
+		if err := viewIndexer.AddViewer(scvKey, scv); err != nil {
+			return nil, err
+		}
 
 		// Set up indexing and index enqueuing
 		if err := viewIndexer.AddIndex(subCatIndexKey, opcache.BuildEnqueuingIndex(scv.subCatViewIndex, subCatQueue)); err != nil {
