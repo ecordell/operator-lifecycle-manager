@@ -15,6 +15,8 @@ type Interface interface {
 	GetBundleInPackageChannel(ctx context.Context, packageName, channelName string) (*registry.Bundle, error)
 	GetReplacementBundleInPackageChannel(ctx context.Context, currentName, packageName, channelName string) (*registry.Bundle, error)
 	GetBundleThatProvides(ctx context.Context, group, version, kind string) (*registry.Bundle, error)
+	HealthCheck(ctx context.Context, reconnectTimeout time.Duration) (bool, error)
+	Close() error
 }
 
 type Client struct {
@@ -59,6 +61,27 @@ func (c *Client) GetBundleThatProvides(ctx context.Context, group, version, kind
 		return nil, err
 	}
 	return parsedBundle, nil
+}
+
+func (c *Client) Close() error {
+	return c.Conn.Close()
+}
+
+func (c *Client) HealthCheck(ctx context.Context, reconnectTimeout time.Duration) (bool, error) {
+	res, err := c.Health.Check(ctx, &grpc_health_v1.HealthCheckRequest{Service: "Registry"})
+	if err != nil {
+		if c.Conn.GetState() == connectivity.TransientFailure {
+			ctx, _ := context.WithTimeout(ctx, reconnectTimeout)
+			if !c.Conn.WaitForStateChange(ctx, connectivity.TransientFailure) {
+				return false, NewHealthError(c, HealthErrReasonUnrecoveredTransient, "connection didn't recover from TransientFailure")
+			}
+		}
+		return false, NewHealthError(c, HealthErrReasonConnection, err)
+	}
+	if res.Status != grpc_health_v1.HealthCheckResponse_SERVING {
+		return false, nil
+	}
+	return true, nil
 }
 
 func NewClient(address string) (*Client, error) {
