@@ -298,7 +298,7 @@ func (a *Operator) pruneProvidedAPIs(group *v1.OperatorGroup, groupProvidedAPIs 
 func (a *Operator) ensureProvidedAPIClusterRole(operatorGroup *v1.OperatorGroup, csv *v1alpha1.ClusterServiceVersion, namePrefix, suffix string, verbs []string, group, resource string, resourceNames []string) error {
 	clusterRole := &rbacv1.ClusterRole{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: namePrefix + suffix,
+			GenerateName: namePrefix + suffix,
 			Labels: map[string]string{
 				kubeRBACAggregationKeyPrefix + suffix:       "true",
 				operatorGroupAggregrationKeyPrefix + suffix: operatorGroup.GetName(),
@@ -426,7 +426,7 @@ func (a *Operator) ensureSingletonRBAC(operatorNamespace string, csv *v1alpha1.C
 					APIVersion: r.APIVersion,
 				},
 				ObjectMeta: metav1.ObjectMeta{
-					Name:   r.GetName(),
+					GenerateName:   r.GetName(),
 					Labels: r.GetLabels(),
 				},
 				Rules: append(r.Rules, rbacv1.PolicyRule{

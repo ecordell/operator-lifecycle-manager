@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	clitesting "k8s.io/client-go/testing"
 	"math"
 	"math/big"
 	"reflect"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	configfake "github.com/openshift/client-go/config/clientset/versioned/fake"
 	"github.com/operator-framework/operator-registry/pkg/registry"
 	"github.com/sirupsen/logrus"
@@ -31,9 +33,9 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilclock "k8s.io/apimachinery/pkg/util/clock"
-	"k8s.io/apimachinery/pkg/util/diff"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8sscheme "k8s.io/client-go/kubernetes/scheme"
@@ -283,6 +285,15 @@ func NewFakeOperator(ctx context.Context, options ...fakeOperatorOption) (*Opera
 	k8sClientFake.Resources = apiResourcesForObjects(append(config.extObjs, config.regObjs...))
 	config.operatorClient = operatorclient.NewClient(k8sClientFake, apiextensionsfake.NewSimpleClientset(config.extObjs...), apiregistrationfake.NewSimpleClientset(config.regObjs...))
 	config.configClient = configfake.NewSimpleClientset()
+
+	// Enable generatename for clusterroles
+	k8sClientFake.PrependReactor("create", "clusterroles", func(action clitesting.Action) (handled bool, ret runtime.Object, err error) {
+		r := action.(clitesting.CreateAction).GetObject().(*rbacv1.ClusterRole)
+		if r.Name == "" && r.GenerateName != "" {
+			r.Name = fmt.Sprintf("%s-%s", r.GenerateName, utilrand.String(16))
+		}
+		return false, nil, nil
+	})
 
 	for _, ns := range config.namespaces {
 		_, err := config.operatorClient.KubernetesInterface().CoreV1().Namespaces().Create(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
@@ -3329,6 +3340,8 @@ func TestUpdates(t *testing.T) {
 	}
 }
 
+
+
 func TestSyncOperatorGroups(t *testing.T) {
 	logrus.SetLevel(logrus.DebugLevel)
 	clockFake := utilclock.NewFakeClock(time.Date(2006, time.January, 2, 15, 4, 5, 0, time.FixedZone("MST", -7*3600)))
@@ -4225,7 +4238,7 @@ func RequireObjectsInCache(t *testing.T, lister operatorlister.OperatorLister, n
 		}
 		if doCompare {
 			if !reflect.DeepEqual(object, fetched) {
-				diff.ObjectDiff(object, fetched)
+				cmp.Diff(object, fetched)
 				return fmt.Errorf("expected object didn't match %v", object)
 			}
 		}
@@ -4250,13 +4263,18 @@ func RequireObjectsInNamespace(t *testing.T, opClient operatorclient.ClientInter
 			fetched, err = opClient.GetRoleBinding(namespace, o.GetName())
 		case *v1alpha1.ClusterServiceVersion:
 			fetched, err = client.OperatorsV1alpha1().ClusterServiceVersions(namespace).Get(o.GetName(), metav1.GetOptions{})
+			// This protects against small timing issues in sync tests
+			// We generally don't care about the conditions (state history in this case, unlike many kube resources)
+			// and this will still check that the final state is correct
+			object.(*v1alpha1.ClusterServiceVersion).Status.Conditions = nil
+			fetched.(*v1alpha1.ClusterServiceVersion).Status.Conditions = nil
 		case *v1.OperatorGroup:
 			fetched, err = client.OperatorsV1().OperatorGroups(namespace).Get(o.GetName(), metav1.GetOptions{})
 		default:
 			require.Failf(t, "couldn't find expected object", "%#v", object)
 		}
 		require.NoError(t, err, "couldn't fetch %s %v", namespace, object)
-		require.True(t, reflect.DeepEqual(object, fetched), diff.ObjectDiff(object, fetched))
+		require.True(t, reflect.DeepEqual(object, fetched), cmp.Diff(object, fetched))
 	}
 }
 
