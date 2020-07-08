@@ -327,9 +327,13 @@ func TestSolve(t *testing.T) {
 			assert.Equal(tt.Installed, installed)
 			assert.Equal(tt.Error, err)
 
-			if t.Failed() {
-				t.Logf("\n%s", traces.String())
-			}
+			t.Logf("\n%s", traces.String())
 		})
 	}
 }
+
+// TODO: the search tests should verify that by the time we're done searching and returned
+// to the CardSort, we're no longer in a deeper test context than we should be.
+//func TestSearch(t *testing.T) {
+//
+//}
